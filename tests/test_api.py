@@ -160,6 +160,8 @@ def test_rows_endpoint_per_row_provenance(client, method_id):
     assert first == {
         "change": 1, "lead": 1, "change_in_lead": 1, "notation": "x",
         "places": [], "source": "method", "call": None, "row": "214365",
+        "method": "Plain Bob Minor", "method_id": "pb-minor",
+        "method_version": 1, "splice": False,
     }
     page = client.get(f"/touches/{tid}/versions/1/rows", params={"offset": 58, "limit": 5}).json()
     assert len(page["rows"]) == 2 and page["rows"][-1]["row"] == "123456"
