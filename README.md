@@ -94,7 +94,9 @@ touch 用 `methods`（替代单方法的 `method_id`）引用多个**同钟数**
 - 创建时拒绝：`STAGE_MISMATCH`（钟数不一致）、方法版本缺失（404）、
   `UNKNOWN_METHOD` / `UNKNOWN_TRANSITION`（引用未声明方法）、
   `UNSATISFIABLE_QUOTA`（配额在固定 lead 与候选槽位下无解，最大流精确判定）、
-  `TRANSITION_VIOLATION`（相邻固定 lead 违反转换规则）
+  `TRANSITION_VIOLATION`（相邻固定 lead 违反转换规则）、
+  `UNSATISFIABLE_CONSTRAINTS`（配额与转换规则联合无解：不存在同时满足
+  两者的 lead 分配，创建即拒绝而非留待枚举得到 0 个方案）
 
 ### 枚举与排序
 
@@ -106,9 +108,10 @@ touch 的 lead 可写 `{"choice": ["plain", "bob", "single"]}`（call 槽位）�
 方法分布更均衡（用量极差）→ 改动数 → 总 change 数** 排序；单方法 touch
 保持 **改动数 → 总 change 数 → rounds 回归** 排序。
 
-`max_variants` 限制组合总数（超出返回 422 `TOO_MANY_VARIANTS`）；
-`max_search` 限制搜索预算，超出时截断并返回 `checked`（已检查组合数）、
-`truncated: true` 与 `truncation_reason`。同一 touch 版本重复枚举结果一致。
+`max_variants` 限制组合总数（超出返回 422 `TOO_MANY_VARIANTS`，响应同样
+携带 `checked` / `truncated` / `truncation_reason`）；`max_search` 限制
+搜索预算，超出时截断并返回 `checked`（已检查组合数）、`truncated: true`
+与 `truncation_reason`。同一 touch 版本重复枚举结果一致。
 
 ## 示例
 

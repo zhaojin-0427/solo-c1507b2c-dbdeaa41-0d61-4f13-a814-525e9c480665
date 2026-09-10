@@ -4,7 +4,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from ringproof.engine import build_lead, prove_rows
-from ringproof.feasibility import quota_feasible
+from ringproof.feasibility import joint_assignment_feasible, quota_feasible
 from ringproof.main import create_app
 from ringproof.notation import expand_notation
 
@@ -178,6 +178,59 @@ def test_fixed_transition_violation_rejected(client, methods):
     )
     assert r2.status_code == 422
     assert r2.json()["detail"]["code"] == "TRANSITION_VIOLATION"
+
+
+def test_joint_quota_and_transition_unsatisfiable_rejected(client, methods):
+    # 配额要求恰好 1 个 alt-minor，但两个方向的拼接都被禁止：
+    # 配额单独可满足（最大流通过），联合转换规则后无任何可行分配
+    seq = [{"leads": [{"method_choice": ["pb-minor", "alt-minor"]}], "repeat": 2}]
+    r = client.post(
+        "/touches",
+        json=_multi_payload(
+            sequence=seq,
+            method_quotas={"alt-minor": {"min": 1, "max": 1}},
+            forbidden_transitions=[["pb-minor", "alt-minor"], ["alt-minor", "pb-minor"]],
+        ),
+    )
+    assert r.status_code == 422
+    assert r.json()["detail"]["code"] == "UNSATISFIABLE_CONSTRAINTS"
+
+
+def test_joint_constraints_empty_whitelist_unsatisfiable(client, methods):
+    # 空白名单（禁止一切方法变化）+ 配额要求恰好 1 个 alt-minor → 不可行
+    seq = [{"leads": [{"method_choice": ["pb-minor", "alt-minor"]}], "repeat": 2}]
+    r = client.post(
+        "/touches",
+        json=_multi_payload(
+            sequence=seq,
+            method_quotas={"alt-minor": {"min": 1, "max": 1}},
+            allowed_transitions=[],
+        ),
+    )
+    assert r.status_code == 422
+    assert r.json()["detail"]["code"] == "UNSATISFIABLE_CONSTRAINTS"
+
+
+def test_joint_constraints_feasible_accepted(client, methods):
+    # 恰好 1 个 alt-minor 且仅禁止 alt→pb：唯一可行分配 pb→alt，
+    # 创建通过，且枚举恰得 1 个方案（不会创建出 0 方案的 touch）
+    seq = [{"leads": [{"method_choice": ["pb-minor", "alt-minor"]}], "repeat": 2}]
+    r = client.post(
+        "/touches",
+        json=_multi_payload(
+            sequence=seq,
+            method_quotas={"alt-minor": {"min": 1, "max": 1}},
+            forbidden_transitions=[["alt-minor", "pb-minor"]],
+        ),
+    )
+    assert r.status_code == 201
+    tid = r.json()["id"]
+    e = client.post(f"/touches/{tid}/versions/1/enumerate", json={}).json()
+    assert e["total_combos"] == 4
+    assert e["pruned_by_quota"] == 2
+    assert e["pruned_by_transition"] == 1
+    assert e["total_variants"] == 1
+    assert e["variants"][0]["methods"] == ["pb-minor", "alt-minor"]
 
 
 def test_touch_create_schema_guards(client, methods):
@@ -389,6 +442,32 @@ def test_enumerate_sort_prefers_true_rounds_fewer_splices(client, methods):
     assert plain[0]["total_changes"] == 60
 
 
+def test_enumerate_variant_cap_reports_checked_and_truncation(client, methods):
+    # 组合数超 max_variants：除 TOO_MANY_VARIANTS 外还须给出已检查数量与截断原因
+    seq = [{"leads": [{"choice": ["plain", "bob", "single"]}], "repeat": 6}]
+    r = client.post(
+        "/touches",
+        json=_multi_payload(
+            sequence=seq,
+            calls={
+                "bob": {"notation": "14", "replace": 1},
+                "single": {"notation": "1234", "replace": 1},
+            },
+        ),
+    )
+    assert r.status_code == 201
+    tid = r.json()["id"]
+    resp = client.post(f"/touches/{tid}/versions/1/enumerate", json={"max_variants": 100})
+    assert resp.status_code == 422
+    body = resp.json()
+    assert body["detail"]["code"] == "TOO_MANY_VARIANTS"
+    assert body["total_combos"] == 729
+    assert body["max_variants"] == 100
+    assert body["checked"] == 0
+    assert body["truncated"] is True
+    assert "max_variants" in body["truncation_reason"]
+
+
 def test_enumerate_truncation_reports_checked_and_reason(client, methods):
     seq = [{"leads": [{"choice": ["plain", "bob"]}], "repeat": 10}]
     r = client.post(
@@ -498,6 +577,26 @@ def test_engine_transition_violation_and_quota_breach_reported():
     assert r["transition_violations"] == [
         {"lead": 2, "from_method": "a", "to_method": "b", "rule": "forbidden"}
     ]
+
+
+def test_joint_assignment_feasible_unit():
+    cands = [{"a", "b"}, {"a", "b"}]
+    q = {"b": {"min": 1, "max": 1}}
+    # 两个方向都禁止：无同时满足配额与转换的分配
+    assert not joint_assignment_feasible(cands, q, None, {("a", "b"), ("b", "a")}, ["a", "b"])
+    # 只禁 b→a：a→b 可行
+    assert joint_assignment_feasible(cands, q, None, {("b", "a")}, ["a", "b"])
+    # 无转换约束：配额可行即联合可行
+    assert joint_assignment_feasible(cands, q, None, set(), ["a", "b"])
+    # 空白名单 + 恰好一个 b：不可行
+    assert not joint_assignment_feasible(cands, q, set(), set(), ["a", "b"])
+    # 三 lead：首 lead 固定 a，禁 b→a，b 至少 1 个 → a,a,b 可行
+    cands3 = [{"a"}, {"a", "b"}, {"a", "b"}]
+    assert joint_assignment_feasible(cands3, {"b": {"min": 1}}, None, {("b", "a")}, ["a", "b"])
+    # 再禁 a→b → b 永远无法出现，不可行
+    assert not joint_assignment_feasible(
+        cands3, {"b": {"min": 1}}, None, {("b", "a"), ("a", "b")}, ["a", "b"]
+    )
 
 
 def test_quota_feasible_exact_check():

@@ -16,7 +16,7 @@ from fastapi.responses import JSONResponse
 
 from . import __version__
 from .engine import TouchError, build_lead, prove_rows, transition_ok
-from .feasibility import quota_feasible
+from .feasibility import joint_assignment_feasible, quota_feasible
 from .notation import NotationError, expand_notation, parse_row, row_to_string
 from .schemas import EnumerateRequest, MethodCreate, MethodRef, TouchCreate
 from .storage import Storage, canonical_hash, utcnow
@@ -289,10 +289,20 @@ def create_app(db_path: str | None = None) -> FastAPI:
         for _, options in call_slots + method_slots:
             total_combos *= len(options)
         if total_combos > body.max_variants:
-            raise TouchError(
-                "TOO_MANY_VARIANTS",
-                f"组合数 {total_combos} 超过 max_variants={body.max_variants}，"
-                "请减少 choice 槽位或提高上限",
+            reason = f"组合数 {total_combos} 超过 max_variants={body.max_variants}"
+            return JSONResponse(
+                status_code=422,
+                content={
+                    "detail": {
+                        "code": "TOO_MANY_VARIANTS",
+                        "message": f"{reason}，请减少 choice 槽位或提高上限",
+                    },
+                    "total_combos": total_combos,
+                    "max_variants": body.max_variants,
+                    "checked": 0,
+                    "truncated": True,
+                    "truncation_reason": reason,
+                },
             )
 
         quotas = ctx["quotas"]
@@ -648,6 +658,17 @@ def create_app(db_path: str | None = None) -> FastAPI:
                     f"{a['method']}→{b['method']} 不在允许列表中"
                 )
                 raise TouchError("TRANSITION_VIOLATION", msg)
+
+        # 配额 + 转换规则联合可行性：不存在同时满足两者的分配时拒绝创建，
+        # 避免出现创建成功但枚举恒为 0 个方案的 touch
+        if not joint_assignment_feasible(
+            candidates, quotas, allowed, forbidden, method_ids
+        ):
+            raise TouchError(
+                "UNSATISFIABLE_CONSTRAINTS",
+                "方法配额与相邻转换规则无法同时满足："
+                "不存在既符合各方法 min/max 又符合转换规则的 lead 分配",
+            )
 
         leads_summary = []
         for i, l in enumerate(flat_leads, 1):

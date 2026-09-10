@@ -15,6 +15,8 @@ from __future__ import annotations
 
 from collections import deque
 
+from .engine import transition_ok
+
 
 class _Dinic:
     def __init__(self, n: int):
@@ -127,3 +129,80 @@ def quota_feasible(
         elif d < 0:
             din.add_edge(v, TT, -d)
     return din.maxflow(SS, TT) == total_pos
+
+
+def joint_assignment_feasible(
+    candidates: list[set[str]],
+    quotas: dict[str, dict],
+    allowed: set[tuple[str, str]] | None,
+    forbidden: set[tuple[str, str]],
+    method_ids: list[str],
+    state_budget: int = 1_000_000,
+) -> bool:
+    """判定是否存在同时满足方法配额与相邻转换规则的 lead→method 分配。
+
+    调用前需保证配额单独可行（``quota_feasible`` 为真）。DP 状态为
+    ``(上一方法, 各受限方法用量的截断计数)``：有 max 的方法精确计数
+    （超限即剪枝），仅有 min 的方法在 min 处饱和计数。状态总数超过
+    ``state_budget`` 时按可行处理（枚举仍会精确剪枝），避免误拒合法 touch。
+    """
+    n = len(candidates)
+    if n == 0:
+        return True
+    if allowed is None and not forbidden:
+        return True  # 无转换约束：配额可行即联合可行
+
+    constrained = [
+        m
+        for m in method_ids
+        if (quotas.get(m) or {}).get("min") is not None
+        or (quotas.get(m) or {}).get("max") is not None
+    ]
+    caps = []
+    for m in constrained:
+        q = quotas[m]
+        hi, lo = q.get("max"), q.get("min")
+        caps.append(hi if hi is not None else (lo or 0))
+    cidx = {m: i for i, m in enumerate(constrained)}
+
+    def bump(counts: tuple[int, ...], m: str) -> tuple[int, ...] | None:
+        i = cidx.get(m)
+        if i is None:
+            return counts
+        c = counts[i]
+        if c >= caps[i]:
+            if quotas[m].get("max") is not None:
+                return None  # 超过 max，剪枝
+            return counts  # 无 max：在 min 处饱和
+        return counts[:i] + (c + 1,) + counts[i + 1 :]
+
+    zero = tuple(0 for _ in constrained)
+    frontier: set[tuple[str, tuple[int, ...]]] = set()
+    for m in candidates[0]:
+        c = bump(zero, m)
+        if c is not None:
+            frontier.add((m, c))
+    states_seen = len(frontier)
+    for pos in range(1, n):
+        nxt: set[tuple[str, tuple[int, ...]]] = set()
+        for last, counts in frontier:
+            for m in candidates[pos]:
+                if not transition_ok(last, m, allowed, forbidden)[0]:
+                    continue
+                c = bump(counts, m)
+                if c is not None:
+                    nxt.add((m, c))
+        states_seen += len(nxt)
+        if not nxt:
+            return False
+        if states_seen > state_budget:
+            return True  # 预算耗尽：按可行处理，避免误拒
+        frontier = nxt
+    # 终点：所有 min 达标（max 已在扩展时剪枝）
+    for _, counts in frontier:
+        if all(
+            quotas[m].get("min") is None or counts[i] >= quotas[m]["min"]
+            for i, m in enumerate(constrained)
+        ):
+            return True
+    return False
