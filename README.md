@@ -12,6 +12,13 @@ call 来源），并可枚举 call 变体。方法与 touch 以不可变版本�
 枚举时按配额与转换规则剪枝并优先返回为真、回到 rounds、拼接较少且方法
 分布更均衡的方案。
 
+支持**音乐模式评分与选优**：调用方可为指定钟数创建不可变评分方案，组合
+精确 row、位于前端/后端的正序或逆序连续钟组、指定钟位置三类规则，每条
+规则可设名称、分值、是否允许叠加与单个 row 的计分上限；证明 touch 时
+引用方案即得总分、各规则命中数与首次/最高分 row（追溯 change、lead、
+method、call），枚举时可设最低总分或规则命中数门槛过滤并参与排序。
+方案版本随 touch 冻结，重复证明与枚举结果一致。
+
 ## 运行
 
 ```bash
@@ -49,8 +56,10 @@ python3 -m uvicorn ringproof.main:app --port 8765
 | POST | `/touches` | 创建 touch 版本（起始排列、calls、lead 顺序、max_calls、多方法拼接、配额与转换规则） |
 | GET | `/touches/{id}/versions/{v}` | 规范化后的 touch 与输入哈希 |
 | GET | `/touches/{id}/versions/{v}/rows` | 逐行来源（change、lead、记号、方法 id/版本、call 与拼接标记），支持分页 |
-| POST | `/touches/{id}/versions/{v}/prove` | 序列证明（按版本缓存，`X-Proof-Cache` 头标识命中） |
-| POST | `/touches/{id}/versions/{v}/enumerate` | 枚举 call×method 候选组合（配额/转换剪枝、排序、截断说明） |
+| POST | `/touches/{id}/versions/{v}/prove` | 序列证明，可引用评分方案（按版本+方案缓存，`X-Proof-Cache` 头标识命中） |
+| POST | `/touches/{id}/versions/{v}/enumerate` | 枚举 call×method 候选组合（配额/转换剪枝、音乐门槛过滤、排序、截断说明） |
+| POST | `/music-schemes` | 创建评分方案版本（指定钟数；同 id 递增版本，不可变） |
+| GET | `/music-schemes/{id}/versions/{v}` | 方案规则、计分开关与输入哈希 |
 
 ### 证明结果字段
 
@@ -115,6 +124,51 @@ touch 的 lead 可写 `{"choice": ["plain", "bob", "single"]}`（call 槽位）�
 搜索预算，超出时截断并返回 `checked`（已检查组合数）、`truncated: true`
 与 `truncation_reason`。同一 touch 版本重复枚举结果一致。
 
+### 音乐模式评分
+
+评分方案按钟数创建、版本不可变，组合三类规则（每条规则设 `name`、
+`points`（可为负）、`allow_overlap`、`max_per_row`）：
+
+```json
+{
+  "id": "music-6", "name": "六钟音乐", "stage": 6,
+  "rules": [
+    {"type": "row", "name": "queens-ish", "points": 10, "row": "135264"},
+    {"type": "run", "name": "back-56", "points": 2, "bells": [5, 6], "position": "back"},
+    {"type": "run", "name": "front-654", "points": 3, "bells": [6, 5, 4], "position": "front"},
+    {"type": "positions", "name": "5-front", "points": 1,
+     "allow_overlap": true, "max_per_row": 2,
+     "positions": [{"bell": 5, "position": 1}, {"bell": 6, "position": 6}]}
+  ],
+  "score_start_row": false,
+  "score_final_rounds": false
+}
+```
+
+- `row` — 整行与指定排列完全一致（须为 1..stage 的完整排列）；
+- `run` — 正序或逆序连续钟组出现在 row 前端（`front`）或后端（`back`）；
+- `positions` — 每满足一个 (钟, 位置) 对计一次命中；`allow_overlap=false`
+  时每行至多计 1 次，`max_per_row` 限制每条规则从单个 row 计分的命中次数。
+
+创建时拒绝非法规则（不落库）：不完整排列（`ROW_NOT_PERMUTATION` /
+`ROW_LENGTH_MISMATCH`）、越界钟号（`BELL_OUT_OF_RANGE`）、与钟数不符的
+位置（`POSITION_OUT_OF_RANGE`）、非连续钟组（`RUN_NOT_CONSECUTIVE`）、
+重复钟号/位置对/规则名等。
+
+证明时在请求体引用方案：`POST /touches/{id}/versions/{v}/prove`
+`{"music": {"id": "music-6"}}`（`version` 留空则随 touch 版本冻结为首次
+使用时的最新版本）。结果新增 `music` 段：`total_score`、各规则 `hits` /
+`score`、`rows_scored`，以及 `first_scoring_row` / `highest_scoring_row`
+（含 change、lead、method、call 来源；平分取最早 row）。起始 row 与末尾
+rounds 是否计分由方案的 `score_start_row` / `score_final_rounds` 指定，
+其余 row（含中间回到的 rounds）一律计分。方案钟数与 touch 不符返回 422
+`MUSIC_STAGE_MISMATCH`。
+
+枚举时同样可引用方案，并可设 `min_music_score` / `min_music_hits` 门槛：
+在配额、转换、max_calls 筛选之后按门槛过滤（计数 `filtered_by_music`），
+变体按 **真值 → rounds 回归 → 音乐分（高者优先）→ 既有排序项** 稳定排序，
+每个变体携带 `music_score` / `music_hits`。设置门槛时必须引用方案。
+
 ## 示例
 
 ```bash
@@ -134,7 +188,19 @@ curl -X POST localhost:8765/touches -H 'Content-Type: application/json' -d \
 curl -X POST localhost:8765/touches/pc/versions/1/prove
 # → total_changes 60, truth "true", rounds_return true, rounds_at [0, 60]
 
-# 4. 多方法拼接：两个方法 + 配额 + 禁止 alt→pb 转换 + 候选槽位
+# 4. 定义评分方案（精确 row + 后端连续钟组 + 指定钟位置）
+curl -X POST localhost:8765/music-schemes -H 'Content-Type: application/json' -d \
+  '{"id":"music-6","name":"六钟音乐","stage":6,
+    "rules":[{"type":"row","name":"queens-ish","points":10,"row":"135264"},
+             {"type":"run","name":"back-56","points":2,"bells":[5,6],"position":"back"},
+             {"type":"positions","name":"5-front","points":1,"allow_overlap":true,
+              "positions":[{"bell":5,"position":1},{"bell":6,"position":6}]}]}'
+
+# 5. 引用评分方案证明（总分、各规则命中数、首次/最高分 row 来源）
+curl -X POST localhost:8765/touches/pc/versions/1/prove \
+  -H 'Content-Type: application/json' -d '{"music":{"id":"music-6"}}'
+
+# 6. 多方法拼接：两个方法 + 配额 + 禁止 alt→pb 转换 + 候选槽位
 curl -X POST localhost:8765/touches -H 'Content-Type: application/json' -d \
   '{"id":"spliced","methods":[{"id":"pb-minor"},{"id":"alt-minor"}],
     "calls":{"bob":{"notation":"14","replace":1}},
@@ -144,14 +210,20 @@ curl -X POST localhost:8765/touches -H 'Content-Type: application/json' -d \
       {"method_choice":["pb-minor","alt-minor"],"choice":["plain","bob"]},
       {"method":"pb-minor"}]}]}'
 
-# 5. 枚举候选组合（剪枝 + 排序 + 截断说明）
+# 7. 枚举候选组合（剪枝 + 排序 + 截断说明）
 curl -X POST localhost:8765/touches/spliced/versions/1/enumerate \
   -H 'Content-Type: application/json' -d '{}'
 # → total_combos 4, pruned_by_transition 2, variants 按真值/rounds/拼接数排序
+
+# 8. 枚举 + 音乐门槛：低于最低总分的变体被过滤并计数
+curl -X POST localhost:8765/touches/spliced/versions/1/enumerate \
+  -H 'Content-Type: application/json' \
+  -d '{"music":{"id":"music-6"},"min_music_score":10}'
+# → sorted_by 以 music_score 优先于拼接数，filtered_by_music 给出被过滤数量
 ```
 
 ## 测试
 
 ```bash
-python3 -m pytest tests/ -q   # 63 个用例
+python3 -m pytest tests/ -q   # 76 个用例
 ```

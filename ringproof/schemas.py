@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -136,6 +137,79 @@ class TouchCreate(BaseModel):
         return self
 
 
+class BellPosition(BaseModel):
+    """一个 (钟, 位置) 对：指定钟号须出现在指定位置（1 起）。"""
+
+    bell: int = Field(ge=1, le=12, description="钟号")
+    position: int = Field(ge=1, le=12, description="位置（1 为前端）")
+
+
+class MusicRuleBase(BaseModel):
+    """评分规则公共配置：名称、分值、是否允许叠加、单个 row 的计分上限。"""
+
+    name: str = Field(min_length=1, max_length=100, description="规则名称（同一方案内唯一）")
+    points: int = Field(default=1, description="每次命中的分值（可为负，表示惩罚）")
+    allow_overlap: bool = Field(
+        default=False, description="是否允许同一行内多次命中叠加计分（positions 规则）"
+    )
+    max_per_row: int | None = Field(
+        default=None, ge=1, description="单个 row 的计分上限（命中次数），null 表示不限制"
+    )
+
+
+class RowRule(MusicRuleBase):
+    """精确 row 规则：整行与指定排列完全一致时命中。"""
+
+    type: Literal["row"] = "row"
+    row: str = Field(min_length=1, description="目标排列，须为 1..stage 的完整排列")
+
+
+class RunRule(MusicRuleBase):
+    """连续钟组规则：正序或逆序的连续钟组出现在 row 前端或后端时命中。"""
+
+    type: Literal["run"] = "run"
+    bells: list[int] = Field(min_length=1, description="连续钟组（正序如 [4,5,6]，逆序如 [6,5,4]）")
+    position: Literal["front", "back"] = Field(description="钟组出现的位置：前端或后端")
+
+
+class PositionsRule(MusicRuleBase):
+    """指定钟位置规则：每满足一个 (钟, 位置) 对计一次命中。"""
+
+    type: Literal["positions"] = "positions"
+    positions: list[BellPosition] = Field(min_length=1, description="(钟, 位置) 对列表")
+
+
+MusicRule = Annotated[RowRule | RunRule | PositionsRule, Field(discriminator="type")]
+
+
+class MusicSchemeCreate(BaseModel):
+    """定义一个音乐评分方案版本：指定钟数 + 三类规则的组合。
+
+    起始 row 与末尾 rounds 默认不计分，可由 score_start_row /
+    score_final_rounds 开启；其余 row（含中间回到的 rounds）一律计分。
+    """
+
+    id: str | None = Field(default=None, description="留空则自动生成；同名 id 递增版本")
+    name: str = Field(min_length=1, max_length=200)
+    stage: int = Field(description="钟数，4~12；规则中的钟号/位置/排列须与之相符")
+    rules: list[MusicRule] = Field(min_length=1, description="评分规则列表（至少一条）")
+    score_start_row: bool = Field(default=False, description="起始 row 是否计分")
+    score_final_rounds: bool = Field(default=False, description="末尾回到 rounds 的最后一 row 是否计分")
+
+
+class MusicRef(BaseModel):
+    """引用一个评分方案的不可变版本；version 留空则随 touch 冻结为首次使用时的最新版本。"""
+
+    id: str
+    version: int | None = Field(default=None, ge=1, description="留空则引用该方案的最新版本（随 touch 冻结）")
+
+
+class ProveRequest(BaseModel):
+    """证明请求：可引用音乐评分方案，结果附带音乐评分。"""
+
+    music: MusicRef | None = Field(default=None, description="音乐评分方案引用（留空则不评分）")
+
+
 class EnumerateRequest(BaseModel):
     """枚举 choice / method_choice 槽位的全部 call×method 候选组合。"""
 
@@ -145,6 +219,15 @@ class EnumerateRequest(BaseModel):
         default=1024, ge=1, le=100000,
         description="搜索预算：最多检查的候选组合数，超出则截断并说明原因",
     )
+    music: MusicRef | None = Field(default=None, description="音乐评分方案引用（留空则不评分）")
+    min_music_score: int | None = Field(default=None, description="音乐总分门槛：低于该值的变体被过滤")
+    min_music_hits: int | None = Field(default=None, ge=0, description="规则命中数门槛：总命中数低于该值的变体被过滤")
+
+    @model_validator(mode="after")
+    def _check_music(self) -> "EnumerateRequest":
+        if (self.min_music_score is not None or self.min_music_hits is not None) and self.music is None:
+            raise ValueError("设置音乐门槛（min_music_score/min_music_hits）时必须引用评分方案 music")
+        return self
 
 
 def _validate_call_ref(name: str, allow_plain: bool = False) -> None:

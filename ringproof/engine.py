@@ -118,6 +118,7 @@ def _provenance(row_index: int, events: list[dict]) -> dict:
         "change_in_lead": ev["change_in_lead"],
         "notation": ev["notation"],
         "source": ev["source"],
+        "call": ev["call"],
     }
 
 

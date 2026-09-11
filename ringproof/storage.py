@@ -1,7 +1,9 @@
-"""SQLite 不可变版本存储：方法、touch 与证明结果。
+"""SQLite 不可变版本存储：方法、touch、音乐评分方案与证明结果。
 
-方法与 touch 以 (id, version) 为主键只增不改；证明结果以
-(touch_id, touch_version) 为主键缓存，保证同一版本重复证明结果一致。
+方法、touch 与评分方案以 (id, version) 为主键只增不改；证明结果以
+(touch_id, touch_version, music_id, music_version) 为主键缓存，
+保证同一版本（含所引用的评分方案版本）重复证明结果一致。
+touch_music 记录 touch 版本首次引用某评分方案时冻结的版本。
 """
 from __future__ import annotations
 
@@ -39,10 +41,30 @@ CREATE TABLE IF NOT EXISTS touches (
 CREATE TABLE IF NOT EXISTS proofs (
     touch_id TEXT NOT NULL,
     touch_version INTEGER NOT NULL,
+    music_id TEXT NOT NULL,
+    music_version INTEGER NOT NULL,
     input_hash TEXT NOT NULL,
     result_json TEXT NOT NULL,
     created_at TEXT NOT NULL,
-    PRIMARY KEY (touch_id, touch_version)
+    PRIMARY KEY (touch_id, touch_version, music_id, music_version)
+);
+CREATE TABLE IF NOT EXISTS music_schemes (
+    id TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    stage INTEGER NOT NULL,
+    spec_json TEXT NOT NULL,
+    input_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (id, version)
+);
+CREATE TABLE IF NOT EXISTS touch_music (
+    touch_id TEXT NOT NULL,
+    touch_version INTEGER NOT NULL,
+    music_id TEXT NOT NULL,
+    music_version INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (touch_id, touch_version, music_id)
 );
 """
 
@@ -63,6 +85,12 @@ class Storage:
         self._conn.row_factory = sqlite3.Row
         self._lock = threading.Lock()
         with self._lock:
+            # proofs 为可再生的缓存表：旧库缺少音乐维度列时直接重建
+            cols = [
+                r[1] for r in self._conn.execute("PRAGMA table_info(proofs)").fetchall()
+            ]
+            if cols and "music_id" not in cols:
+                self._conn.execute("DROP TABLE proofs")
             self._conn.executescript(SCHEMA)
 
     # ---------------- methods ----------------
@@ -161,11 +189,18 @@ class Storage:
         return [dict(r) for r in rows]
 
     # ---------------- proofs ----------------
-    def get_proof(self, touch_id: str, touch_version: int) -> dict | None:
+    def get_proof(
+        self,
+        touch_id: str,
+        touch_version: int,
+        music_id: str = "",
+        music_version: int = 0,
+    ) -> dict | None:
         with self._lock:
             row = self._conn.execute(
-                "SELECT * FROM proofs WHERE touch_id = ? AND touch_version = ?",
-                (touch_id, touch_version),
+                "SELECT * FROM proofs WHERE touch_id = ? AND touch_version = ?"
+                " AND music_id = ? AND music_version = ?",
+                (touch_id, touch_version, music_id, music_version),
             ).fetchone()
         return dict(row) if row else None
 
@@ -173,13 +208,93 @@ class Storage:
         with self._lock:
             self._conn.execute(
                 "INSERT OR IGNORE INTO proofs"
-                " (touch_id, touch_version, input_hash, result_json, created_at)"
+                " (touch_id, touch_version, music_id, music_version,"
+                " input_hash, result_json, created_at)"
+                " VALUES (?,?,?,?,?,?,?)",
+                (
+                    rec["touch_id"],
+                    rec["touch_version"],
+                    rec.get("music_id", ""),
+                    rec.get("music_version", 0),
+                    rec["input_hash"],
+                    rec["result_json"],
+                    rec["created_at"],
+                ),
+            )
+            self._conn.commit()
+
+    # ---------------- music schemes ----------------
+    def next_music_version(self, scheme_id: str) -> int:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT MAX(version) AS v FROM music_schemes WHERE id = ?", (scheme_id,)
+            ).fetchone()
+            return (row["v"] or 0) + 1
+
+    def insert_music_scheme(self, rec: dict) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO music_schemes"
+                " (id, version, name, stage, spec_json, input_hash, created_at)"
+                " VALUES (?,?,?,?,?,?,?)",
+                (
+                    rec["id"],
+                    rec["version"],
+                    rec["name"],
+                    rec["stage"],
+                    rec["spec_json"],
+                    rec["input_hash"],
+                    rec["created_at"],
+                ),
+            )
+            self._conn.commit()
+
+    def get_music_scheme(self, scheme_id: str, version: int) -> dict | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM music_schemes WHERE id = ? AND version = ?",
+                (scheme_id, version),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def latest_music_version(self, scheme_id: str) -> int | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT MAX(version) AS v FROM music_schemes WHERE id = ?", (scheme_id,)
+            ).fetchone()
+        return row["v"]
+
+    def list_music_schemes(self) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, version, name, stage, input_hash, created_at"
+                " FROM music_schemes ORDER BY id, version"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ---------------- touch 的评分方案版本冻结 ----------------
+    def get_touch_music(
+        self, touch_id: str, touch_version: int, music_id: str
+    ) -> dict | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM touch_music"
+                " WHERE touch_id = ? AND touch_version = ? AND music_id = ?",
+                (touch_id, touch_version, music_id),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def insert_touch_music(self, rec: dict) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO touch_music"
+                " (touch_id, touch_version, music_id, music_version, created_at)"
                 " VALUES (?,?,?,?,?)",
                 (
                     rec["touch_id"],
                     rec["touch_version"],
-                    rec["input_hash"],
-                    rec["result_json"],
+                    rec["music_id"],
+                    rec["music_version"],
                     rec["created_at"],
                 ),
             )
