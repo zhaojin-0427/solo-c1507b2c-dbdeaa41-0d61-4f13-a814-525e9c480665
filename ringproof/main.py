@@ -660,10 +660,18 @@ def create_app(db_path: str | None = None) -> FastAPI:
                 raise TouchError("TRANSITION_VIOLATION", msg)
 
         # 配额 + 转换规则联合可行性：不存在同时满足两者的分配时拒绝创建，
-        # 避免出现创建成功但枚举恒为 0 个方案的 touch
-        if not joint_assignment_feasible(
+        # 避免出现创建成功但枚举恒为 0 个方案的 touch；校验超出状态预算
+        # （结果未知）时同样拒绝（fail-closed），保证未校验的 touch 不落库
+        joint = joint_assignment_feasible(
             candidates, quotas, allowed, forbidden, method_ids
-        ):
+        )
+        if joint is None:
+            raise TouchError(
+                "CONSTRAINT_CHECK_LIMIT",
+                "方法配额与相邻转换规则的联合校验超出状态预算，无法确认可行性；"
+                "请收紧配额或减少候选方法后重试",
+            )
+        if not joint:
             raise TouchError(
                 "UNSATISFIABLE_CONSTRAINTS",
                 "方法配额与相邻转换规则无法同时满足："

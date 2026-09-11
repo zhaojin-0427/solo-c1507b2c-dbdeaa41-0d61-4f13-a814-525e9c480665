@@ -138,13 +138,16 @@ def joint_assignment_feasible(
     forbidden: set[tuple[str, str]],
     method_ids: list[str],
     state_budget: int = 1_000_000,
-) -> bool:
+) -> bool | None:
     """判定是否存在同时满足方法配额与相邻转换规则的 lead→method 分配。
+
+    返回 True/False 表示确定可行/不可行；返回 None 表示状态数超出
+    ``state_budget``、无法确定（调用方须按不可行拒绝，fail-closed，
+    避免未校验的 touch 落库）。
 
     调用前需保证配额单独可行（``quota_feasible`` 为真）。DP 状态为
     ``(上一方法, 各受限方法用量的截断计数)``：有 max 的方法精确计数
-    （超限即剪枝），仅有 min 的方法在 min 处饱和计数。状态总数超过
-    ``state_budget`` 时按可行处理（枚举仍会精确剪枝），避免误拒合法 touch。
+    （超限即剪枝），仅有 min 的方法在 min 处饱和计数。
     """
     n = len(candidates)
     if n == 0:
@@ -196,7 +199,7 @@ def joint_assignment_feasible(
         if not nxt:
             return False
         if states_seen > state_budget:
-            return True  # 预算耗尽：按可行处理，避免误拒
+            return None  # 预算耗尽：结果未知，由调用方 fail-closed 拒绝
         frontier = nxt
     # 终点：所有 min 达标（max 已在扩展时剪枝）
     for _, counts in frontier:

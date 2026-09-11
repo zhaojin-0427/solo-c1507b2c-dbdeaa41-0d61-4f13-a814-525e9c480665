@@ -233,6 +233,36 @@ def test_joint_constraints_feasible_accepted(client, methods):
     assert e["variants"][0]["methods"] == ["pb-minor", "alt-minor"]
 
 
+def test_joint_check_budget_exhaustion_fails_closed(client, methods):
+    # 9 个方法各 max=13；13 个候选 lead + 固定末 lead m1；
+    # 禁止一切转入 m1 的拼接（同方法延续除外）→ 唯一形状是全 m1，
+    # 但 14 个 lead 超过 max=13，联合无解。状态空间超出校验预算：
+    # 此前预算耗尽被当作可行而返回 201 并落库，现应 fail-closed 拒绝。
+    ms = [f"m{i}" for i in range(1, 10)]
+    for mid in ms:
+        r = client.post(
+            "/methods",
+            json={"id": mid, "name": mid, "stage": 6, "notation": PB_MINOR},
+        )
+        assert r.status_code == 201
+    payload = {
+        "id": "budget-repro",
+        "methods": [{"id": m} for m in ms],
+        "method_quotas": {m: {"max": 13} for m in ms},
+        "forbidden_transitions": [[m, "m1"] for m in ms if m != "m1"],
+        "sequence": [
+            {"leads": [{"method_choice": ms}], "repeat": 13},
+            {"leads": [{"method": "m1"}]},
+        ],
+    }
+    r = client.post("/touches", json=payload)
+    assert r.status_code == 422
+    assert r.json()["detail"]["code"] == "CONSTRAINT_CHECK_LIMIT"
+    # 不落库：touch 不存在任何版本
+    assert client.get("/touches/budget-repro").status_code == 404
+    assert client.get("/touches/budget-repro/versions/1").status_code == 404
+
+
 def test_touch_create_schema_guards(client, methods):
     # methods 与 method_id 互斥
     r = client.post(
@@ -596,6 +626,17 @@ def test_joint_assignment_feasible_unit():
     # 再禁 a→b → b 永远无法出现，不可行
     assert not joint_assignment_feasible(
         cands3, {"b": {"min": 1}}, None, {("b", "a"), ("a", "b")}, ["a", "b"]
+    )
+
+
+def test_joint_assignment_feasible_budget_unknown():
+    # 预算耗尽返回 None（未知），由创建端 fail-closed 拒绝
+    cands = [{"a", "b"}, {"a", "b"}, {"a", "b"}]
+    assert (
+        joint_assignment_feasible(
+            cands, {"a": {"min": 2}}, None, {("a", "b")}, ["a", "b"], state_budget=1
+        )
+        is None
     )
 
 

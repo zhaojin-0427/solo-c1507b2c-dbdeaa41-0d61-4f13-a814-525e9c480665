@@ -96,7 +96,9 @@ touch 用 `methods`（替代单方法的 `method_id`）引用多个**同钟数**
   `UNSATISFIABLE_QUOTA`（配额在固定 lead 与候选槽位下无解，最大流精确判定）、
   `TRANSITION_VIOLATION`（相邻固定 lead 违反转换规则）、
   `UNSATISFIABLE_CONSTRAINTS`（配额与转换规则联合无解：不存在同时满足
-  两者的 lead 分配，创建即拒绝而非留待枚举得到 0 个方案）
+  两者的 lead 分配，创建即拒绝而非留待枚举得到 0 个方案）、
+  `CONSTRAINT_CHECK_LIMIT`（联合校验超出状态预算、无法确认可行性，
+  fail-closed 拒绝，未校验的 touch 不落库）
 
 ### 枚举与排序
 
@@ -151,5 +153,5 @@ curl -X POST localhost:8765/touches/spliced/versions/1/enumerate \
 ## 测试
 
 ```bash
-python3 -m pytest tests/ -q   # 56 个用例
+python3 -m pytest tests/ -q   # 63 个用例
 ```
