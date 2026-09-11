@@ -87,17 +87,43 @@ def build_lead(
     )
 
 
+def adjacent_places(prev: tuple[int, ...], row: tuple[int, ...]) -> frozenset[int] | None:
+    """若 row 由 prev 经过一次合法 change（每个非 place 位置与相邻位置互换）
+    得到，返回该 change 的 places 集合；否则返回 None。"""
+    n = len(prev)
+    if len(row) != n:
+        return None
+    places: list[int] = []
+    i = 0
+    while i < n:
+        if prev[i] == row[i]:
+            places.append(i + 1)
+            i += 1
+        elif i + 1 < n and prev[i] == row[i + 1] and prev[i + 1] == row[i]:
+            i += 2
+        else:
+            return None
+    return frozenset(places)
+
+
 def transition_ok(
     from_id: str,
     to_id: str,
     allowed: set[tuple[str, str]] | None,
     forbidden: set[tuple[str, str]],
+    strict_allowed: bool = False,
 ) -> tuple[bool, str | None]:
-    """检查相邻 lead 的方法转换是否合法。同方法延续始终允许。"""
-    if from_id == to_id:
-        return True, None
+    """检查相邻 lead 的方法转换是否合法。同方法延续默认始终允许。
+
+    - 黑名单优先：显式列入 forbidden 的转换（含同方法）一律拒绝；
+    - 白名单非空时，跨方法转换须在白名单内；
+    - ``strict_allowed`` 为真时（前缀续接搜索），同方法延续也须显式列入
+      白名单，即白名单是转换的完整枚举。
+    """
     if (from_id, to_id) in forbidden:
         return False, "forbidden"
+    if not strict_allowed and from_id == to_id:
+        return True, None
     if allowed is not None and (from_id, to_id) not in allowed:
         return False, "not_in_allowed"
     return True, None

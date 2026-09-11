@@ -66,6 +66,41 @@ CREATE TABLE IF NOT EXISTS touch_music (
     created_at TEXT NOT NULL,
     PRIMARY KEY (touch_id, touch_version, music_id)
 );
+CREATE TABLE IF NOT EXISTS prefixes (
+    id TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    stage INTEGER NOT NULL,
+    state_json TEXT NOT NULL,
+    replay_json TEXT NOT NULL,
+    input_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (id, version)
+);
+CREATE TABLE IF NOT EXISTS prefix_music (
+    prefix_id TEXT NOT NULL,
+    prefix_version INTEGER NOT NULL,
+    music_id TEXT NOT NULL,
+    music_version INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (prefix_id, prefix_version, music_id)
+);
+CREATE TABLE IF NOT EXISTS prefix_methods (
+    prefix_id TEXT NOT NULL,
+    prefix_version INTEGER NOT NULL,
+    method_id TEXT NOT NULL,
+    method_version INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (prefix_id, prefix_version, method_id)
+);
+CREATE TABLE IF NOT EXISTS continuations (
+    prefix_id TEXT NOT NULL,
+    prefix_version INTEGER NOT NULL,
+    request_hash TEXT NOT NULL,
+    input_hash TEXT NOT NULL,
+    result_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (prefix_id, prefix_version, request_hash)
+);
 """
 
 
@@ -295,6 +330,132 @@ class Storage:
                     rec["touch_version"],
                     rec["music_id"],
                     rec["music_version"],
+                    rec["created_at"],
+                ),
+            )
+            self._conn.commit()
+
+    # ---------------- prefixes（部分 touch） ----------------
+    def next_prefix_version(self, prefix_id: str) -> int:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT MAX(version) AS v FROM prefixes WHERE id = ?", (prefix_id,)
+            ).fetchone()
+        return (row["v"] or 0) + 1
+
+    def insert_prefix(self, rec: dict) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO prefixes"
+                " (id, version, stage, state_json, replay_json, input_hash, created_at)"
+                " VALUES (?,?,?,?,?,?,?)",
+                (
+                    rec["id"],
+                    rec["version"],
+                    rec["stage"],
+                    rec["state_json"],
+                    rec["replay_json"],
+                    rec["input_hash"],
+                    rec["created_at"],
+                ),
+            )
+            self._conn.commit()
+
+    def get_prefix(self, prefix_id: str, version: int) -> dict | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM prefixes WHERE id = ? AND version = ?",
+                (prefix_id, version),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def list_prefixes(self) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, version, stage, input_hash, created_at"
+                " FROM prefixes ORDER BY id, version"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_prefix_music(
+        self, prefix_id: str, prefix_version: int, music_id: str
+    ) -> dict | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM prefix_music"
+                " WHERE prefix_id = ? AND prefix_version = ? AND music_id = ?",
+                (prefix_id, prefix_version, music_id),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def insert_prefix_music(self, rec: dict) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO prefix_music"
+                " (prefix_id, prefix_version, music_id, music_version, created_at)"
+                " VALUES (?,?,?,?,?)",
+                (
+                    rec["prefix_id"],
+                    rec["prefix_version"],
+                    rec["music_id"],
+                    rec["music_version"],
+                    rec["created_at"],
+                ),
+            )
+            self._conn.commit()
+
+    def get_prefix_methods(
+        self, prefix_id: str, prefix_version: int
+    ) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT method_id, method_version FROM prefix_methods"
+                " WHERE prefix_id = ? AND prefix_version = ? ORDER BY rowid",
+                (prefix_id, prefix_version),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def insert_prefix_method(self, rec: dict) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO prefix_methods"
+                " (prefix_id, prefix_version, method_id, method_version, created_at)"
+                " VALUES (?,?,?,?,?)",
+                (
+                    rec["prefix_id"],
+                    rec["prefix_version"],
+                    rec["method_id"],
+                    rec["method_version"],
+                    rec["created_at"],
+                ),
+            )
+            self._conn.commit()
+
+    # ---------------- 续接搜索缓存 ----------------
+    def get_continuation(
+        self, prefix_id: str, prefix_version: int, request_hash: str
+    ) -> dict | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM continuations"
+                " WHERE prefix_id = ? AND prefix_version = ? AND request_hash = ?",
+                (prefix_id, prefix_version, request_hash),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def insert_continuation(self, rec: dict) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO continuations"
+                " (prefix_id, prefix_version, request_hash, input_hash,"
+                " result_json, created_at)"
+                " VALUES (?,?,?,?,?,?)",
+                (
+                    rec["prefix_id"],
+                    rec["prefix_version"],
+                    rec["request_hash"],
+                    rec["input_hash"],
+                    rec["result_json"],
                     rec["created_at"],
                 ),
             )

@@ -17,15 +17,32 @@ from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse
 
 from . import __version__
-from .engine import TouchError, build_lead, prove_rows, transition_ok
+from .continuation import search_continuations
+from .engine import (
+    ExpandedLead,
+    TouchError,
+    build_lead,
+    prove_rows,
+    transition_ok,
+)
 from .feasibility import joint_assignment_feasible, quota_feasible
 from .music import score_rows, validate_rules
-from .notation import NotationError, expand_notation, parse_row, row_to_string
+from .notation import (
+    NotationError,
+    expand_notation,
+    parse_row,
+    row_to_string,
+    validate_stage,
+)
+from .prefix import replay_prefix
 from .schemas import (
+    CallDef,
+    ContinueRequest,
     EnumerateRequest,
     MethodCreate,
     MethodRef,
     MusicSchemeCreate,
+    PrefixCreate,
     ProveRequest,
     TouchCreate,
 )
@@ -598,6 +615,343 @@ def create_app(db_path: str | None = None) -> FastAPI:
             response["min_music_hits"] = body.min_music_hits
         return response
 
+    # ---------- 部分 touch：前缀校核 ----------
+    @app.post("/prefixes", status_code=201)
+    def create_prefix(body: PrefixCreate):
+        """提交已经敲出的 row 前缀并重放校核；合法时冻结当前排列、已出现
+        row 与相关依赖版本（方法、call、ringproof 版本），供续接搜索。"""
+        ctx_info, err = _build_prefix_input(body)
+        if err is not None:
+            return err
+        replay = replay_prefix(
+            ctx_info["stage"],
+            ctx_info["leads"],
+            ctx_info["rows"],
+            ctx_info["start_row"],
+        )
+        if not replay["valid"]:
+            return JSONResponse(
+                status_code=422,
+                content={
+                    "detail": {
+                        "code": "PREFIX_INVALID",
+                        "message": "前缀校核未通过",
+                        "error": replay["first_error"],
+                    },
+                    "prefix": _prefix_replay_payload(
+                        body.id or "", 0, ctx_info, replay, ctx_info["input_hash"]
+                    ),
+                },
+            )
+
+        prefix_id = body.id or _new_id()
+        version = storage.next_prefix_version(prefix_id)
+        state = {
+            "stage": ctx_info["stage"],
+            "start_row": row_to_string(ctx_info["start_row"]),
+            "current_row": replay["current_row"],
+            "seen_rows": replay["seen_rows"],
+            "accepted_changes": replay["accepted_changes"],
+            "lead_methods": replay["lead_methods"],
+            "leads": [
+                {
+                    "lead": i + 1,
+                    "method": l["method_id"],
+                    "method_version": l["method_version"],
+                    "call": l["call"],
+                    "changes": l["n_changes"],
+                }
+                for i, l in enumerate(ctx_info["leads"])
+            ],
+            "methods": [
+                {"id": m["id"], "version": m["version"], "hash": m["input_hash"]}
+                for m in ctx_info["methods"]
+            ],
+            "calls": ctx_info["call_specs"],
+            "dependencies": _dependencies(
+                ctx_info["methods"], ctx_info["call_specs"], None
+            ),
+        }
+        replay_payload = _prefix_replay_payload(
+            prefix_id, version, ctx_info, replay, ctx_info["input_hash"]
+        )
+        rec = {
+            "id": prefix_id,
+            "version": version,
+            "stage": ctx_info["stage"],
+            "state_json": json.dumps(state, ensure_ascii=False, sort_keys=True),
+            "replay_json": json.dumps(replay_payload, ensure_ascii=False),
+            "input_hash": ctx_info["input_hash"],
+            "created_at": utcnow(),
+        }
+        try:
+            storage.insert_prefix(rec)
+        except sqlite3.IntegrityError:
+            return JSONResponse(status_code=409, content={"detail": "该 (id, version) 已存在，版本不可变"})
+        for m in ctx_info["methods"]:
+            storage.insert_prefix_method(
+                {
+                    "prefix_id": prefix_id,
+                    "prefix_version": version,
+                    "method_id": m["id"],
+                    "method_version": m["version"],
+                    "created_at": utcnow(),
+                }
+            )
+        return JSONResponse(replay_payload, status_code=201)
+
+    @app.get("/prefixes")
+    def list_prefixes():
+        return {"prefixes": storage.list_prefixes()}
+
+    @app.get("/prefixes/{prefix_id}/versions/{version}")
+    def get_prefix(prefix_id: str, version: int):
+        rec = storage.get_prefix(prefix_id, version)
+        if not rec:
+            return JSONResponse(status_code=404, content={"detail": f"前缀版本不存在: {prefix_id} v{version}"})
+        return json.loads(rec["replay_json"])
+
+    @app.get("/prefixes/{prefix_id}/versions/{version}/rows")
+    def get_prefix_rows(
+        prefix_id: str,
+        version: int,
+        offset: int = Query(0, ge=0),
+        limit: int = Query(500, ge=1, le=10000),
+    ):
+        """前缀逐行来源（change、lead、记号、方法 id/版本、call、拼接标记）。"""
+        rec = storage.get_prefix(prefix_id, version)
+        if not rec:
+            return JSONResponse(status_code=404, content={"detail": f"前缀版本不存在: {prefix_id} v{version}"})
+        replay = json.loads(rec["replay_json"])
+        events = replay["events"][offset : offset + limit]
+        return {
+            "prefix_id": prefix_id,
+            "prefix_version": version,
+            "input_hash": rec["input_hash"],
+            "start_row": replay["start_row"],
+            "total_changes": replay["total_changes"],
+            "current_row": replay["current_row"],
+            "methods": replay["methods"],
+            "offset": offset,
+            "limit": limit,
+            "rows": events,
+        }
+
+    # ---------- 部分 touch：续接搜索 ----------
+    @app.post("/prefixes/{prefix_id}/versions/{version}/continuation")
+    def continue_prefix(prefix_id: str, version: int, body: ContinueRequest):
+        """在校核通过的前缀之后搜索不重复的续接尾段；结果按到达目标、
+        尾段长度、call 数、拼接数与音乐分稳定排序，同一前缀与约束重复
+        请求结果一致（按请求内容哈希缓存）。"""
+        rec = storage.get_prefix(prefix_id, version)
+        if not rec:
+            return JSONResponse(status_code=404, content={"detail": f"前缀版本不存在: {prefix_id} v{version}"})
+        state = json.loads(rec["state_json"])
+
+        # 尾段可用方法：显式给出则按显式（版本留空则冻结为最新），否则沿用前缀方法
+        tail_methods, err = _resolve_continuation_methods(prefix_id, version, state, body)
+        if err is not None:
+            return err
+        stage = state["stage"]
+
+        # call 定义：前缀 call 为底，请求 call 同名覆盖/新增
+        call_specs, call_err = _merge_continuation_calls(state, body, tail_methods)
+        if call_err is not None:
+            return call_err
+
+        # 配额 / 转换规则引用的方法须在尾段可用方法内
+        method_ids = [m["id"] for m in tail_methods]
+        for mid in body.method_quotas:
+            if mid not in method_ids:
+                return JSONResponse(
+                    status_code=422,
+                    content={"detail": {"code": "UNKNOWN_METHOD",
+                                        "message": f"method_quotas 引用了尾段不可用的方法: {mid!r}"}},
+                )
+
+        def _pairs_err(pairs, kind):
+            for a, b in pairs or []:
+                for x in (a, b):
+                    if x not in method_ids:
+                        return JSONResponse(
+                            status_code=422,
+                            content={"detail": {"code": "UNKNOWN_TRANSITION",
+                                                "message": f"{kind}转换规则引用了尾段不可用的方法: {x!r}"}},
+                        )
+            return None
+
+        err = _pairs_err(body.allowed_transitions, "允许") or _pairs_err(
+            body.forbidden_transitions, "禁止"
+        )
+        if err is not None:
+            return err
+
+        parsed = {}
+        method_by_id = {}
+        for m in tail_methods:
+            ch = json.loads(m["changes_json"])
+            parsed[m["id"]] = (ch["tokens"], [frozenset(p) for p in ch["places"]])
+            method_by_id[m["id"]] = m
+        min_lead_len = min(len(t) for t, _ in parsed.values())
+        call_defs = {}
+        for name, spec in call_specs.items():
+            ctoks, cchanges = expand_notation(spec["notation"], stage)
+            if not 1 <= spec["replace"] <= min_lead_len:
+                return JSONResponse(
+                    status_code=422,
+                    content={"detail": {"code": "CALL_REPLACE_RANGE",
+                                        "message": f"call {name!r} 替换 {spec['replace']} 个 change，"
+                                                   f"超出尾段方法最小 lead 长度 {min_lead_len}"}},
+                )
+            call_defs[name] = {
+                "notation": spec["notation"],
+                "normalized": ".".join(ctoks),
+                "tokens": ctoks,
+                "changes": cchanges,
+                "replace": spec["replace"],
+            }
+        ctx = {
+            "stage": stage,
+            "method_ids": method_ids,
+            "method_by_id": method_by_id,
+            "parsed": parsed,
+            "call_defs": call_defs,
+        }
+
+        target = parse_row(body.target_row, stage) if body.target_row else tuple(
+            range(1, stage + 1)
+        )
+        start_row = parse_row(state["current_row"], stage)
+        seen_rows = {parse_row(r, stage) for r in state["seen_rows"]}
+        quotas = {
+            mid: {"min": q.min, "max": q.max}
+            for mid, q in body.method_quotas.items()
+        }
+        allowed = (
+            {tuple(p) for p in body.allowed_transitions}
+            if body.allowed_transitions is not None
+            else None
+        )
+        forbidden = {tuple(p) for p in body.forbidden_transitions or []}
+
+        # 音乐方案（版本随前缀冻结）
+        scheme = None
+        music_rules = None
+        music_flags = (False, False)
+        if body.music:
+            scheme, merr = _resolve_prefix_music(
+                prefix_id, version, stage, body.music
+            )
+            if merr is not None:
+                return merr
+            spec_music = json.loads(scheme["spec_json"])
+            music_rules = spec_music["rules"]
+            music_flags = (
+                spec_music["score_start_row"],
+                spec_music["score_final_rounds"],
+            )
+
+        request_key = {
+            "current_row": state["current_row"],
+            "seen_rows": state["seen_rows"],
+            "lead_methods": state["lead_methods"],
+            "max_leads": body.max_leads,
+            "target_row": row_to_string(target),
+            "methods": [
+                {"id": m["id"], "version": m["version"], "hash": m["input_hash"]}
+                for m in tail_methods
+            ],
+            "calls": {
+                k: {"notation": c["notation"], "replace": c["replace"]}
+                for k, c in sorted(call_specs.items())
+            },
+            "max_calls": body.max_calls,
+            "method_quotas": quotas,
+            "allowed_transitions": sorted(allowed) if allowed is not None else None,
+            "forbidden_transitions": sorted(forbidden),
+            "max_results": body.max_results,
+            "max_search": body.max_search,
+            "music": (
+                {"id": scheme["id"], "version": scheme["version"],
+                 "hash": scheme["input_hash"]}
+                if scheme
+                else None
+            ),
+            "min_music_score": body.min_music_score,
+            "min_music_hits": body.min_music_hits,
+        }
+        request_hash = canonical_hash(request_key)
+        cached = storage.get_continuation(prefix_id, version, request_hash)
+        if cached and cached["input_hash"] == rec["input_hash"]:
+            return JSONResponse(
+                json.loads(cached["result_json"]),
+                headers={"X-Continuation-Cache": "hit"},
+            )
+
+        search = search_continuations(
+            ctx,
+            start_row,
+            seen_rows,
+            state["lead_methods"],
+            max_leads=body.max_leads,
+            target=target,
+            max_calls=body.max_calls,
+            max_results=body.max_results,
+            max_search=body.max_search,
+            quotas=quotas,
+            allowed=allowed,
+            forbidden=forbidden,
+            music_rules=music_rules,
+            music_flags=music_flags,
+            min_music_score=body.min_music_score,
+            min_music_hits=body.min_music_hits,
+            prefix_changes=state["accepted_changes"],
+        )
+        if not search["truncated"] and search["solutions_found"] == 0:
+            search["truncation_reason"] = "搜索空间穷尽，未发现满足全部约束的续接方案"
+
+        sorted_by = ["target_reached", "num_leads", "num_changes", "num_calls", "num_splices"]
+        if scheme is not None:
+            sorted_by.append("music_score")
+        payload = {
+            "prefix_id": prefix_id,
+            "prefix_version": version,
+            "input_hash": rec["input_hash"],
+            "request_hash": request_hash,
+            "start_row": state["current_row"],
+            "target_row": row_to_string(target),
+            "max_leads": body.max_leads,
+            "max_calls": body.max_calls,
+            "methods": [_method_summary(m) for m in tail_methods],
+            "calls": sorted(call_defs),
+            "method_quotas": quotas,
+            "allowed_transitions": sorted(allowed) if allowed is not None else None,
+            "forbidden_transitions": sorted(forbidden),
+            "sorted_by": sorted_by,
+            "dependencies": _dependencies(tail_methods, call_specs, scheme),
+            **search,
+        }
+        if scheme is not None:
+            payload["music"] = {
+                "id": scheme["id"],
+                "version": scheme["version"],
+                "name": scheme["name"],
+                "input_hash": scheme["input_hash"],
+                "min_music_score": body.min_music_score,
+                "min_music_hits": body.min_music_hits,
+            }
+        storage.insert_continuation(
+            {
+                "prefix_id": prefix_id,
+                "prefix_version": version,
+                "request_hash": request_hash,
+                "input_hash": rec["input_hash"],
+                "result_json": json.dumps(payload, ensure_ascii=False),
+                "created_at": utcnow(),
+            }
+        )
+        return JSONResponse(payload, headers={"X-Continuation-Cache": "miss"})
+
     # ---------- 其他 ----------
     @app.get("/health")
     def health():
@@ -687,6 +1041,396 @@ def create_app(db_path: str | None = None) -> FastAPI:
             "score_final_rounds": spec["score_final_rounds"],
             **scored,
         }
+
+    def _dependencies(methods: list[dict], call_specs: dict[str, dict], scheme) -> dict:
+        """续接/前缀冻结的相关依赖版本（方法、call 定义、评分方案与本服务版本）。"""
+        return {
+            "ringproof_version": __version__,
+            "methods": [
+                {"id": m["id"], "version": m["version"], "input_hash": m["input_hash"]}
+                for m in methods
+            ],
+            "calls": {
+                k: {"notation": c["notation"], "replace": c["replace"]}
+                for k, c in sorted(call_specs.items())
+            },
+            "music": (
+                {"id": scheme["id"], "version": scheme["version"],
+                 "input_hash": scheme["input_hash"]}
+                if scheme
+                else None
+            ),
+        }
+
+    def _build_call_defs(
+        calls_in: dict, stage: int, methods: list[dict]
+    ) -> tuple[dict[str, dict], dict[str, dict]]:
+        """展开 call 定义；返回 (供重放/构建用 call_defs, 规范化 call_specs)。"""
+        min_lead_len = min(
+            len(json.loads(m["changes_json"])["tokens"]) for m in methods
+        )
+        call_defs: dict[str, dict] = {}
+        call_specs: dict[str, dict] = {}
+        for name, c in calls_in.items():
+            ctoks, cchanges = expand_notation(c.notation, stage)
+            if not 1 <= c.replace <= min_lead_len:
+                raise TouchError(
+                    "CALL_REPLACE_RANGE",
+                    f"call {name!r} 替换 {c.replace} 个 change，超出 lead 长度 {min_lead_len}",
+                )
+            call_defs[name] = {
+                "notation": c.notation,
+                "normalized": ".".join(ctoks),
+                "tokens": ctoks,
+                "changes": cchanges,
+                "replace": c.replace,
+            }
+            call_specs[name] = {"notation": c.notation, "replace": c.replace}
+        return call_defs, call_specs
+
+    def _resolve_method_refs(refs: list[MethodRef], frozen: list[dict] | None = None):
+        """把方法引用解析为不可变方法记录。
+
+        显式版本必须存在；版本留空时优先取 frozen 中已冻结的版本，
+        否则冻结为当前最新版本。返回 (records, None) 或 (None, 错误响应)。
+        """
+        frozen_map = {f["method_id"]: f["method_version"] for f in (frozen or [])}
+        methods = []
+        for ref in refs:
+            if ref.version is not None:
+                mv = ref.version
+            elif ref.id in frozen_map:
+                mv = frozen_map[ref.id]
+            else:
+                mv = storage.latest_method_version(ref.id)
+            m = storage.get_method(ref.id, mv) if mv else None
+            if not m:
+                detail = (
+                    f"方法不存在: {ref.id}"
+                    if ref.version is None and ref.id not in frozen_map
+                    else f"方法版本不存在: {ref.id} v{mv}"
+                )
+                return None, JSONResponse(status_code=404, content={"detail": detail})
+            methods.append(m)
+        return methods, None
+
+    def _prefix_replay_leads(
+        methods: list[dict], lead_labels, call_defs: dict[str, dict]
+    ) -> list[dict]:
+        """把 (方法 id, call) 标注展开为重放用 lead 描述符（含实际 change 序列）。"""
+        by_id = {m["id"]: m for m in methods}
+        default_id = methods[0]["id"]
+        out = []
+        for i, label in enumerate(lead_labels, 1):
+            mid = label.get("method") or default_id
+            if mid not in by_id:
+                raise TouchError(
+                    "UNKNOWN_METHOD", f"第 {i} 个 lead 引用了未声明的方法: {mid!r}"
+                )
+            call = label.get("call")
+            if call is not None and call not in call_defs:
+                raise TouchError(
+                    "UNKNOWN_CALL", f"第 {i} 个 lead 引用了未定义的 call: {call!r}"
+                )
+            m = by_id[mid]
+            ch = json.loads(m["changes_json"])
+            lead = build_lead(
+                ch["tokens"],
+                [frozenset(p) for p in ch["places"]],
+                call,
+                call_defs,
+                method_id=mid,
+                method_version=m["version"],
+                method_name=m["name"],
+            )
+            out.append(
+                {
+                    "method_id": mid,
+                    "method_version": m["version"],
+                    "method_name": m["name"],
+                    "call": lead.call,
+                    "tokens": lead.tokens,
+                    "changes": lead.changes,
+                    "n_changes": len(lead.tokens),
+                }
+            )
+        return out
+
+    def _build_prefix_input(body: PrefixCreate):
+        """解析前缀提交（显式 rows+leads 或 from_touch 引用）。
+
+        返回 (info, None) 或 (None, 错误响应)。NotationError/TouchError
+        由全局异常处理器转为 422。
+        """
+        if body.from_touch is not None:
+            ref = body.from_touch
+            rec = storage.get_touch(ref.touch_id, ref.touch_version)
+            if not rec:
+                return None, JSONResponse(
+                    status_code=404,
+                    content={"detail": f"touch 版本不存在: {ref.touch_id} v{ref.touch_version}"},
+                )
+            ctx = _context_from_record(rec)
+            try:
+                leads_resolved = _resolve_leads(ctx)
+            except TouchError as e:
+                return None, JSONResponse(
+                    status_code=422,
+                    content={"detail": {"code": e.code, "message": e.message}},
+                )
+            result = prove_rows(
+                ctx["stage"],
+                ctx["method"]["name"],
+                leads_resolved,
+                ctx["start_row"],
+            )
+            lead_end_changes = _lead_end_changes(leads_resolved)
+            if ref.up_to_change not in lead_end_changes:
+                return None, JSONResponse(
+                    status_code=422,
+                    content={
+                        "detail": {
+                            "code": "CHANGE_NOT_LEAD_END",
+                            "message": (
+                                f"change {ref.up_to_change} 不是 lead end；"
+                                f"该 touch 的 lead end change 为 {lead_end_changes}"
+                            ),
+                        }
+                    },
+                )
+            methods = list(ctx["methods"])
+            # 截止 change 落在的 lead 序号
+            cut_lead = 0
+            cum = 0
+            for i, l in enumerate(leads_resolved, 1):
+                cum += len(l.tokens)
+                if cum == ref.up_to_change:
+                    cut_lead = i
+                    break
+            events = result["events"][: ref.up_to_change]
+            rows = [ev["row"] for ev in events]
+            labels = [
+                {"method": result["lead_methods"][i], "call": leads_resolved[i].call}
+                for i in range(cut_lead)
+            ]
+            call_specs = {
+                k: {"notation": c["notation"], "replace": c["replace"]}
+                for k, c in ctx["call_defs"].items()
+            }
+            leads = _prefix_replay_leads(methods, labels, ctx["call_defs"])
+            input_hash = canonical_hash(
+                {
+                    "source": "touch",
+                    "touch_id": ref.touch_id,
+                    "touch_version": ref.touch_version,
+                    "touch_hash": rec["input_hash"],
+                    "up_to_change": ref.up_to_change,
+                }
+            )
+            return {
+                "stage": ctx["stage"],
+                "methods": methods,
+                "start_row": ctx["start_row"],
+                "leads": leads,
+                "rows": rows,
+                "call_specs": call_specs,
+                "source": {
+                    "type": "touch",
+                    "touch_id": ref.touch_id,
+                    "touch_version": ref.touch_version,
+                    "up_to_change": ref.up_to_change,
+                },
+                "input_hash": input_hash,
+            }, None
+
+        # 显式模式
+        validate_stage(body.stage)
+        methods, err = _resolve_method_refs(body.methods)
+        if err is not None:
+            return None, err
+        stages = {m["stage"] for m in methods}
+        if len(stages) != 1 or body.stage not in stages:
+            return None, JSONResponse(
+                status_code=422,
+                content={"detail": {"code": "STAGE_MISMATCH",
+                                    "message": "方法钟数须彼此一致且与 stage 相符"}},
+            )
+        start_row = parse_row(body.start_row, body.stage) if body.start_row else tuple(
+            range(1, body.stage + 1)
+        )
+        call_defs, call_specs = _build_call_defs(body.calls, body.stage, methods)
+        leads = _prefix_replay_leads(methods, [l.model_dump() for l in body.leads], call_defs)
+        input_hash = canonical_hash(
+            {
+                "source": "explicit",
+                "stage": body.stage,
+                "start_row": row_to_string(start_row),
+                "methods": [
+                    {"id": m["id"], "version": m["version"], "hash": m["input_hash"]}
+                    for m in methods
+                ],
+                "calls": {
+                    k: {"notation": c["notation"], "replace": c["replace"]}
+                    for k, c in sorted(call_specs.items())
+                },
+                "leads": [{"method": l["method_id"], "call": l["call"]} for l in leads],
+                "rows": [r.strip().upper() for r in body.rows],
+            }
+        )
+        return {
+            "stage": body.stage,
+            "methods": methods,
+            "start_row": start_row,
+            "leads": leads,
+            "rows": body.rows,
+            "call_specs": call_specs,
+            "source": {"type": "explicit"},
+            "input_hash": input_hash,
+        }, None
+
+    def _lead_end_changes(leads: list[ExpandedLead]) -> list[int]:
+        out, cum = [], 0
+        for l in leads:
+            cum += len(l.tokens)
+            out.append(cum)
+        return out
+
+    def _prefix_replay_payload(
+        prefix_id: str, version: int, info: dict, replay: dict, input_hash: str
+    ) -> dict:
+        return {
+            "id": prefix_id,
+            "version": version,
+            "source": info["source"],
+            "stage": replay["stage"],
+            "start_row": replay["start_row"],
+            "current_row": replay["current_row"],
+            "valid": replay["valid"],
+            "total_changes": replay["total_changes"],
+            "accepted_changes": replay["accepted_changes"],
+            "permutation_complete": replay["permutation_complete"],
+            "lead_methods": replay["lead_methods"],
+            "lead_end_changes": replay["lead_end_indices"],
+            "seen_rows": replay["seen_rows"],
+            "frozen": {
+                "current_row": replay["current_row"],
+                "seen_rows": replay["seen_rows"],
+                "lead_methods": replay["lead_methods"],
+            },
+            "first_error": replay["first_error"],
+            "methods": _method_summaries(info["methods"]),
+            "calls": info["call_specs"],
+            "dependencies": _dependencies(info["methods"], info["call_specs"], None),
+            "events": replay["events"],
+            "input_hash": input_hash,
+        }
+
+    def _resolve_prefix_music(prefix_id: str, prefix_version: int, stage: int, ref):
+        """解析评分方案版本：显式版本直接使用；留空则随前缀版本冻结
+        （首次引用时定格为最新版本）。返回 (scheme, None) 或 (None, 响应)。"""
+        if ref.version is not None:
+            scheme = storage.get_music_scheme(ref.id, ref.version)
+            if not scheme:
+                return None, JSONResponse(
+                    status_code=404,
+                    content={"detail": f"评分方案版本不存在: {ref.id} v{ref.version}"},
+                )
+        else:
+            frozen = storage.get_prefix_music(prefix_id, prefix_version, ref.id)
+            mv = (
+                frozen["music_version"]
+                if frozen
+                else storage.latest_music_version(ref.id)
+            )
+            if mv is None:
+                return None, JSONResponse(
+                    status_code=404, content={"detail": f"评分方案不存在: {ref.id}"}
+                )
+            scheme = storage.get_music_scheme(ref.id, mv)
+            if not frozen:
+                storage.insert_prefix_music(
+                    {
+                        "prefix_id": prefix_id,
+                        "prefix_version": prefix_version,
+                        "music_id": ref.id,
+                        "music_version": mv,
+                        "created_at": utcnow(),
+                    }
+                )
+        if scheme["stage"] != stage:
+            return None, JSONResponse(
+                status_code=422,
+                content={
+                    "detail": {
+                        "code": "MUSIC_STAGE_MISMATCH",
+                        "message": f"评分方案 {ref.id!r} 为 {scheme['stage']} 口钟，"
+                        f"与前缀的 {stage} 口不符",
+                    }
+                },
+            )
+        return scheme, None
+
+    def _resolve_continuation_methods(prefix_id: str, version: int, state: dict, body: ContinueRequest):
+        """尾段可用方法：请求显式给出时按请求解析（并冻结未标版本的引用），
+        否则沿用前缀冻结的方法集合。"""
+        frozen = storage.get_prefix_methods(prefix_id, version)
+        refs = body.methods or [MethodRef(id=m["id"], version=m["version"]) for m in state["methods"]]
+        ids = [r.id for r in refs]
+        if len(set(ids)) != len(ids):
+            return None, JSONResponse(
+                status_code=422,
+                content={"detail": {"code": "DUPLICATE_METHOD",
+                                    "message": "尾段方法列表存在重复的方法 id"}},
+            )
+        methods, err = _resolve_method_refs(refs, frozen)
+        if err is not None:
+            return None, err
+        stage = state["stage"]
+        if any(m["stage"] != stage for m in methods):
+            return None, JSONResponse(
+                status_code=422,
+                content={"detail": {"code": "STAGE_MISMATCH",
+                                    "message": f"尾段方法均须为 {stage} 口钟"}},
+            )
+        # 未标版本且首次引用的方法在此冻结
+        for ref, m in zip(refs, methods):
+            if ref.version is None and not any(
+                f["method_id"] == m["id"] for f in frozen
+            ):
+                storage.insert_prefix_method(
+                    {
+                        "prefix_id": prefix_id,
+                        "prefix_version": version,
+                        "method_id": m["id"],
+                        "method_version": m["version"],
+                        "created_at": utcnow(),
+                    }
+                )
+        return methods, None
+
+    def _merge_continuation_calls(state: dict, body: ContinueRequest, methods: list[dict]):
+        """前缀 call 定义为底，请求 call 同名覆盖/新增；逐个展开校验。"""
+        merged: dict[str, CallDef] = {
+            k: CallDef(**v) for k, v in state["calls"].items()
+        }
+        if body.calls:
+            for name, c in body.calls.items():
+                merged[name] = c
+        if not merged:
+            return {}, None
+        try:
+            _, call_specs = _build_call_defs(merged, state["stage"], methods)
+        except NotationError as e:
+            return None, JSONResponse(
+                status_code=422,
+                content={"detail": {"code": e.code, "message": e.message}},
+            )
+        except TouchError as e:
+            return None, JSONResponse(
+                status_code=422,
+                content={"detail": {"code": e.code, "message": e.message}},
+            )
+        return call_specs, None
 
     def _method_detail(rec: dict) -> dict:
         changes = json.loads(rec["changes_json"])

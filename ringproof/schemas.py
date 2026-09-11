@@ -237,3 +237,112 @@ def _validate_call_ref(name: str, allow_plain: bool = False) -> None:
         raise ValueError(f"{name!r} 为保留字，不能用作 call 名；无 call 请用 null")
     if not CALL_NAME_RE.match(name):
         raise ValueError(f"非法 call 名: {name!r}（须为字母开头的字母/数字/_/-）")
+
+
+# ---------------- 部分 touch（前缀）与续接 ----------------
+
+
+class PrefixLead(BaseModel):
+    """前缀中的一个 lead：方法 id（缺省用首选方法）与 call（null=plain）。"""
+
+    method: str | None = Field(default=None, description="方法 id；null 表示用首选方法")
+    call: str | None = Field(default=None, description="call 名称；null 表示 plain lead")
+
+
+class PrefixFromTouch(BaseModel):
+    """引用不可变 touch 的指定 change 作为前缀（该 change 须位于 lead end）。"""
+
+    touch_id: str
+    touch_version: int = Field(ge=1)
+    up_to_change: int = Field(ge=1, description="前缀截止的 change 序号（须为某个 lead end）")
+
+
+class PrefixCreate(BaseModel):
+    """提交部分 touch：显式 rows+leads，或引用不可变 touch 的指定 change。
+
+    显式模式下 ``rows`` 为不含起始 row 的逐 change row，长度须等于各标注
+    lead 的 change 数之和（前缀须止于 lead end）。
+    """
+
+    id: str | None = Field(default=None, description="留空则自动生成；同名 id 递增版本")
+    stage: int | None = Field(default=None, description="钟数；from_touch 模式可留空（取 touch 钟数）")
+    methods: list[MethodRef] | None = Field(default=None, description="前缀引用的同钟数方法（版本留空则冻结为最新）")
+    calls: dict[str, CallDef] = Field(default_factory=dict, description="前缀标注用到的 call 定义")
+    start_row: str | None = Field(default=None, description="起始排列，缺省为 rounds")
+    leads: list[PrefixLead] | None = Field(default=None, description="逐 lead 的方法/call 标注（显式模式）")
+    rows: list[str] | None = Field(default=None, description="已敲出的逐 change row（显式模式，不含起始 row）")
+    from_touch: PrefixFromTouch | None = Field(
+        default=None, description="从不可变 touch 的指定 lead end change 导出前缀"
+    )
+
+    @field_validator("calls")
+    @classmethod
+    def _check_call_names(cls, v: dict[str, CallDef]) -> dict[str, CallDef]:
+        for name in v:
+            _validate_call_ref(name)
+        return v
+
+    @model_validator(mode="after")
+    def _check_mode(self) -> "PrefixCreate":
+        if self.from_touch is not None:
+            if any(v is not None for v in (self.leads, self.rows)):
+                raise ValueError("from_touch 与 leads/rows 只能二选一")
+        else:
+            if self.stage is None:
+                raise ValueError("显式前缀必须提供 stage")
+            if not self.methods:
+                raise ValueError("显式前缀必须提供 methods")
+            if not self.leads:
+                raise ValueError("显式前缀必须提供非空 leads")
+            if self.rows is None:
+                raise ValueError("显式前缀必须提供 rows")
+        return self
+
+
+class ContinueRequest(BaseModel):
+    """在前缀之后搜索续接尾段。
+
+    方法/call/配额/转换规则均只作用于尾段；相邻转换规则同时约束
+    前缀末 lead 方法 → 尾段首 lead 方法。
+    """
+
+    max_leads: int = Field(default=12, ge=1, le=200, description="剩余 lead 数上限")
+    target_row: str | None = Field(default=None, description="目标 row，缺省为 rounds；须出现在尾段末 row")
+    methods: list[MethodRef] | None = Field(
+        default=None, description="尾段可用方法；缺省沿用前缀方法（版本随前缀冻结）"
+    )
+    calls: dict[str, CallDef] | None = Field(
+        default=None, description="尾段可用 call；缺省沿用前缀 call，同名可覆盖"
+    )
+    max_calls: int | None = Field(default=None, ge=0, description="尾段替换（call）次数上限")
+    method_quotas: dict[str, MethodQuota] = Field(
+        default_factory=dict, description="尾段各方法用量配额（按尾段 lead 计）"
+    )
+    allowed_transitions: list[TransitionPair] | None = Field(
+        default=None, description="相邻 lead 间允许的方法转换白名单（同方法延续始终允许）"
+    )
+    forbidden_transitions: list[TransitionPair] | None = Field(
+        default=None, description="相邻 lead 间禁止的方法转换"
+    )
+    max_results: int = Field(default=50, ge=1, le=500, description="最多返回的方案数")
+    max_search: int = Field(
+        default=20000, ge=1, le=2_000_000,
+        description="搜索预算：最多检查的状态（前缀路径）数，超出则截断并说明原因",
+    )
+    music: MusicRef | None = Field(default=None, description="音乐评分方案引用（随前缀版本冻结）")
+    min_music_score: int | None = Field(default=None, description="音乐总分门槛：低于该值的方案被过滤")
+    min_music_hits: int | None = Field(default=None, ge=0, description="规则命中数门槛")
+
+    @field_validator("calls")
+    @classmethod
+    def _check_call_names(cls, v: dict[str, CallDef] | None) -> dict[str, CallDef] | None:
+        if v:
+            for name in v:
+                _validate_call_ref(name)
+        return v
+
+    @model_validator(mode="after")
+    def _check_music(self) -> "ContinueRequest":
+        if (self.min_music_score is not None or self.min_music_hits is not None) and self.music is None:
+            raise ValueError("设置音乐门槛（min_music_score/min_music_hits）时必须引用评分方案 music")
+        return self

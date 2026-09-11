@@ -60,6 +60,10 @@ python3 -m uvicorn ringproof.main:app --port 8765
 | POST | `/touches/{id}/versions/{v}/enumerate` | 枚举 call×method 候选组合（配额/转换剪枝、音乐门槛过滤、排序、截断说明） |
 | POST | `/music-schemes` | 创建评分方案版本（指定钟数；同 id 递增版本，不可变） |
 | GET | `/music-schemes/{id}/versions/{v}` | 方案规则、计分开关与输入哈希 |
+| POST | `/prefixes` | 提交部分 touch 前缀（显式 rows+leads，或 from_touch 引用指定 lead end change）并重放校核 |
+| GET | `/prefixes/{id}/versions/{v}` | 前缀冻结状态（当前排列、已出现 row、lead 方法、依赖版本、逐行事件） |
+| GET | `/prefixes/{id}/versions/{v}/rows` | 前缀逐行来源（分页） |
+| POST | `/prefixes/{id}/versions/{v}/continuation` | 续接搜索：目标 row、剩余 lead 上限、方法/call、配额与转换规则、音乐评分，稳定排序+截断进度 |
 
 ### 证明结果字段
 
@@ -169,6 +173,78 @@ rounds 是否计分由方案的 `score_start_row` / `score_final_rounds` 指定�
 变体按 **真值 → rounds 回归 → 音乐分（高者优先）→ 既有排序项** 稳定排序，
 每个变体携带 `music_score` / `music_hits`。设置门槛时必须引用方案。
 
+## 部分 touch：前缀校核与续接
+
+作曲进行到一半时，可把**已经敲出的 row 前缀**提交校核，再让系统搜索
+不与前缀重复的续接尾段。前缀与续接均为不可变版本，依赖版本
+（方法、call、评分方案、`ringproof_version`）随前缀冻结。
+
+### 提交前缀：`POST /prefixes`
+
+两种模式（二选一）：
+
+- **显式 rows + lead 标注**：`stage`、`methods`（版本留空则冻结为最新）、
+  `calls`、`leads`（逐个 lead 标注 `method` 与 `call`）与 `rows`
+  （逐 change row，**不含起始 row**）。`rows` 长度须等于标注 lead 的
+  change 数之和——前缀须止于 **lead end**。
+- **引用不可变 touch**：`from_touch: {touch_id, touch_version, up_to_change}`，
+  其中 `up_to_change` 必须是某个 lead end（否则 422 `CHANGE_NOT_LEAD_END`）；
+  方法、call、起始排列全部取自该 touch 版本。
+
+重放时逐 change 校核：排列完整性（`ROW_NOT_PERMUTATION`）、相邻换位
+（`NOT_ADJACENT`）、实际 places 与标注方法/call 的记号一致性
+（`NOTATION_MISMATCH`），并定位首个重复 row（`REPEATED_ROW`，末尾回到
+rounds 属正常回归）。校核失败返回 422 `PREFIX_INVALID`，响应体 `prefix`
+段仍给出首个非法处的 `at_change`、期望来源（method/lead/call/记号）、
+已接受 change 数与**冻结的当前排列**；非法前缀不落库。
+
+合法前缀返回 201 并冻结：
+
+- `current_row` / `seen_rows` — 当前排列与已出现的全部 row（续接搜索的禁重集合）；
+- `lead_methods` / `lead_end_changes` — 逐 lead 方法与 lead end change 序号；
+- `frozen`、`dependencies` — 冻结状态与方法/call/ringproof 版本；
+- `events` — 逐行来源（change、lead、记号、实际/期望 places、方法 id/版本、
+  call、`splice` 标记）。
+
+另有 `GET /prefixes/{id}/versions/{v}` 与
+`GET /prefixes/{id}/versions/{v}/rows`（分页）。
+
+### 续接搜索：`POST /prefixes/{id}/versions/{v}/continuation`
+
+| 参数 | 说明 |
+|---|---|
+| `max_leads` | 剩余 lead 数上限（默认 12） |
+| `target_row` | 目标 row（缺省 rounds），须出现在尾段末 row |
+| `methods` | 尾段可用方法；缺省沿用前缀方法（版本随前缀冻结） |
+| `calls` | 尾段可用 call；以前缀 call 为底、同名覆盖/新增 |
+| `max_calls` | 尾段 call 数上限 |
+| `method_quotas` | 各方法尾段用量 min/max（按尾段 lead 计，**不**计前缀用量） |
+| `allowed_transitions` / `forbidden_transitions` | 相邻方法转换白/黑名单；同时约束前缀末 lead → 尾段首 lead |
+| `max_results` / `max_search` | 返回方案上限（默认 50）/ 搜索状态预算（默认 20000） |
+| `music` + `min_music_score` / `min_music_hits` | 引用评分方案（版本随前缀冻结）与门槛 |
+
+搜索固定分支顺序（方法按声明顺序、call 按 plain 优先再按名称）做深度优先
+枚举，因此**同一前缀与约束重复请求结果一致**（按请求内容哈希缓存，
+`X-Continuation-Cache: hit/miss`）。剪枝计数 `pruned_by_quota` /
+`pruned_by_transition` / `pruned_by_repeat` / `filtered_by_max_calls` /
+`filtered_by_music`。每个结果：
+
+- `leads` — 逐 lead 标明 `lead`（全局序号）、`method`/`method_version`、`call`；
+- `rows` / `events` — 尾段逐 row 与逐 change 来源（全局 change 编号、
+  lead、记号、方法 id/版本、call、`splice` 标记）；
+- `num_leads` / `num_changes` / `num_calls` / `num_splices`（拼接含前缀边界）；
+- `method_counts` 与 `quota_remaining`（各方法已用/剩余 min/max）；
+- `music_score` / `music_hits`（引用方案时）。
+
+稳定排序：**到达目标 → 尾段 lead 数 → change 数 → call 数 → 拼接数 →
+音乐分（高者优先）→ 确定性字典序**。无解或预算耗尽时返回
+`deepest_progress`（最深 lead 数、当前 row 与方法/call 路径）、
+`checked_states` 与 `truncation_reason`（穷尽时说明未发现方案，
+截断时说明达到 `max_search`）。
+
+> 续接的转换白名单是转换的**完整枚举**（同方法延续也须显式列出，例如
+> `["pb","pb"]`）；黑名单始终优先于一切放行。
+
 ## 示例
 
 ```bash
@@ -220,10 +296,28 @@ curl -X POST localhost:8765/touches/spliced/versions/1/enumerate \
   -H 'Content-Type: application/json' \
   -d '{"music":{"id":"music-6"},"min_music_score":10}'
 # → sorted_by 以 music_score 优先于拼接数，filtered_by_music 给出被过滤数量
+
+# 9. 提交已敲出的 3 个 plain lead（36 row）前缀，按 lead 标注方法/call
+curl -X POST localhost:8765/prefixes -H 'Content-Type: application/json' -d \
+  '{"id":"pfx","stage":6,"methods":[{"id":"pb-minor"}],
+    "calls":{"bob":{"notation":"14","replace":1}},
+    "leads":[{"call":null},{"call":null},{"call":null}],
+    "rows":["214365","... 共 36 个 row ..."]}'
+# → valid true，冻结 current_row、seen_rows 与方法/ringproof 版本
+
+# 10. 搜索续接到 rounds 的尾段（≤3 lead），并引用音乐方案排序
+curl -X POST localhost:8765/prefixes/pfx/versions/1/continuation \
+  -H 'Content-Type: application/json' \
+  -d '{"max_leads":3,"music":{"id":"music-6"}}'
+# → results[0] 为剩余 2 个 plain lead，尾 row=123456，逐 lead/row 标来源与配额余量
+
+# 11. 也可直接引用不可变 touch 的某个 lead end change 作为前缀
+curl -X POST localhost:8765/prefixes -H 'Content-Type: application/json' -d \
+  '{"from_touch":{"touch_id":"pc","touch_version":1,"up_to_change":36}}'
 ```
 
 ## 测试
 
 ```bash
-python3 -m pytest tests/ -q   # 76 个用例
+python3 -m pytest tests/ -q   # 103 个用例
 ```
