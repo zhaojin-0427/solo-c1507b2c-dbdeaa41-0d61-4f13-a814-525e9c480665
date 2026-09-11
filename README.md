@@ -60,7 +60,7 @@ python3 -m uvicorn ringproof.main:app --port 8765
 | POST | `/touches/{id}/versions/{v}/enumerate` | 枚举 call×method 候选组合（配额/转换剪枝、音乐门槛过滤、排序、截断说明） |
 | POST | `/music-schemes` | 创建评分方案版本（指定钟数；同 id 递增版本，不可变） |
 | GET | `/music-schemes/{id}/versions/{v}` | 方案规则、计分开关与输入哈希 |
-| POST | `/prefixes` | 提交部分 touch 前缀（显式 rows+leads，或 from_touch 引用指定 lead end change）并重放校核 |
+| POST | `/prefixes` | 提交部分 touch 前缀（显式 rows+leads，或 from_touch 引用任意 change，可在 lead 中途）并重放校核 |
 | GET | `/prefixes/{id}/versions/{v}` | 前缀冻结状态（当前排列、已出现 row、lead 方法、依赖版本、逐行事件） |
 | GET | `/prefixes/{id}/versions/{v}/rows` | 前缀逐行来源（分页） |
 | POST | `/prefixes/{id}/versions/{v}/continuation` | 续接搜索：目标 row、剩余 lead 上限、方法/call、配额与转换规则、音乐评分，稳定排序+截断进度 |
@@ -185,10 +185,13 @@ rounds 是否计分由方案的 `score_start_row` / `score_final_rounds` 指定�
 
 - **显式 rows + lead 标注**：`stage`、`methods`（版本留空则冻结为最新）、
   `calls`、`leads`（逐个 lead 标注 `method` 与 `call`）与 `rows`
-  （逐 change row，**不含起始 row**）。`rows` 长度须等于标注 lead 的
-  change 数之和——前缀须止于 **lead end**。
+  （逐 change row，**不含起始 row**）。`rows` 长度可为 1..标注 lead 的
+  change 总数之间的任意值：止于最后一个 lead 中途时，该 lead 记为
+  **部分 lead**（响应 `partial_lead` 给出方法、已敲/剩余 change 数；
+  `ends_at_lead_end` 为 false），续接时会先**强制敲完该 lead 的剩余
+  change**再扩展完整 lead。
 - **引用不可变 touch**：`from_touch: {touch_id, touch_version, up_to_change}`，
-  其中 `up_to_change` 必须是某个 lead end（否则 422 `CHANGE_NOT_LEAD_END`）；
+  `up_to_change` 可位于 lead 中途（超出范围返回 422 `CHANGE_OUT_OF_RANGE`）；
   方法、call、起始排列全部取自该 touch 版本。
 
 重放时逐 change 校核：排列完整性（`ROW_NOT_PERMUTATION`）、相邻换位
@@ -201,7 +204,9 @@ rounds 属正常回归）。校核失败返回 422 `PREFIX_INVALID`，响应体 
 合法前缀返回 201 并冻结：
 
 - `current_row` / `seen_rows` — 当前排列与已出现的全部 row（续接搜索的禁重集合）；
-- `lead_methods` / `lead_end_changes` — 逐 lead 方法与 lead end change 序号；
+- `lead_methods` / `lead_end_changes` — 逐 lead 方法与已完成 lead 的 lead end change 序号；
+- `partial_lead` / `ends_at_lead_end` — 末尾部分 lead 的方法/call/已敲/剩余
+  change 数（止于 lead end 时分别为 null / true）；
 - `frozen`、`dependencies` — 冻结状态与方法/call/ringproof 版本；
 - `events` — 逐行来源（change、lead、记号、实际/期望 places、方法 id/版本、
   call、`splice` 标记）。
@@ -227,23 +232,30 @@ rounds 属正常回归）。校核失败返回 422 `PREFIX_INVALID`，响应体 
 枚举，因此**同一前缀与约束重复请求结果一致**（按请求内容哈希缓存，
 `X-Continuation-Cache: hit/miss`）。剪枝计数 `pruned_by_quota` /
 `pruned_by_transition` / `pruned_by_repeat` / `filtered_by_max_calls` /
-`filtered_by_music`。每个结果：
+`filtered_by_music`。**每个被访问且未超 max 配额的 lead end 都会成为候选**：
+部分 lead 前缀先产生一个 `num_leads=0` 的强制段候选（只含强制敲完的剩余
+change），之后每个完整 lead 末端都入 `results`——**无论是否到达目标**，
+未到目标候选以 `reached_target: false` 标记并排到所有到达方案之后。每个结果：
 
-- `leads` — 逐 lead 标明 `lead`（全局序号）、`method`/`method_version`、`call`；
-- `rows` / `events` — 尾段逐 row 与逐 change 来源（全局 change 编号、
-  lead、记号、方法 id/版本、call、`splice` 标记）；
+- `forced_remainder` — 部分 lead 的强制剩余段（方法、版本、call、剩余
+  change 数与强制段末 row）；无部分 lead 时为 null；
+- `leads` — 尾段完整 lead，逐个标明 `lead`（全局序号）、
+  `method`/`method_version`、`call`；
+- `rows` / `events` — 强制段+尾段的逐 row 与逐 change 来源（全局 change
+  编号、lead、记号、方法 id/版本、call、`forced_remainder`/`splice` 标记）；
 - `num_leads` / `num_changes` / `num_calls` / `num_splices`（拼接含前缀边界）；
 - `method_counts` 与 `quota_remaining`（各方法已用/剩余 min/max）；
-- `music_score` / `music_hits`（引用方案时）。
+- `reached_target` / `target_row` 与 `music_score` / `music_hits`（引用方案时）。
 
-稳定排序：**到达目标 → 尾段 lead 数 → change 数 → call 数 → 拼接数 →
+稳定排序：**到达目标 → 尾段完整 lead 数 → call 数 → 拼接数 → change 数 →
 音乐分（高者优先）→ 确定性字典序**。无解或预算耗尽时返回
 `deepest_progress`（最深 lead 数、当前 row 与方法/call 路径）、
 `checked_states` 与 `truncation_reason`（穷尽时说明未发现方案，
-截断时说明达到 `max_search`）。
+截断时说明达到 `max_search`；强制剩余段本身重复时返回
+`forced_remainder_impossible`）。
 
-> 续接的转换白名单是转换的**完整枚举**（同方法延续也须显式列出，例如
-> `["pb","pb"]`）；黑名单始终优先于一切放行。
+> 转换白名单只约束**跨方法**转换；**同方法延续始终允许**（即使白名单
+> 非空，也不必显式列出 `["pb","pb"]`）；黑名单始终优先于一切放行。
 
 ## 示例
 
@@ -311,13 +323,14 @@ curl -X POST localhost:8765/prefixes/pfx/versions/1/continuation \
   -d '{"max_leads":3,"music":{"id":"music-6"}}'
 # → results[0] 为剩余 2 个 plain lead，尾 row=123456，逐 lead/row 标来源与配额余量
 
-# 11. 也可直接引用不可变 touch 的某个 lead end change 作为前缀
+# 11. 也可直接引用不可变 touch 的任意 change 作为前缀（可在 lead 中途）
 curl -X POST localhost:8765/prefixes -H 'Content-Type: application/json' -d \
-  '{"from_touch":{"touch_id":"pc","touch_version":1,"up_to_change":36}}'
+  '{"from_touch":{"touch_id":"pc","touch_version":1,"up_to_change":10}}'
+# → partial_lead 给出 consumed=10/lead_length=12，续接时先强制敲完剩余 2 个 change
 ```
 
 ## 测试
 
 ```bash
-python3 -m pytest tests/ -q   # 103 个用例
+python3 -m pytest tests/ -q   # 106 个用例
 ```

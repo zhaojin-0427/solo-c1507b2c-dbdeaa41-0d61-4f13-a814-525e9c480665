@@ -200,11 +200,31 @@ def test_prefix_final_rounds_is_valid(client, pb_touch):
     assert all(x["num_leads"] > 0 for x in cont2["results"])
 
 
-def test_prefix_length_must_end_at_lead_end(client, pb_touch):
-    rows = _touch_rows(client, pb_touch)[:10]  # 不是 lead end
-    r = _explicit_prefix(client, rows, 1)
-    assert r.status_code == 422
-    err = r.json()["prefix"]["first_error"]
+def test_prefix_may_end_mid_lead(client, pb_touch):
+    # 前缀可止于 lead 中途：1 个标注 lead 只敲了 10 个 change
+    all_rows = _touch_rows(client, pb_touch)
+    r = _explicit_prefix(client, all_rows[:10], 1, id="mid")
+    assert r.status_code == 201, r.text
+    p = r.json()
+    assert p["valid"] and p["ends_at_lead_end"] is False
+    pl = p["partial_lead"]
+    assert pl == {
+        "lead": 1,
+        "method_id": "pb-minor",
+        "method_version": 1,
+        "call": None,
+        "consumed": 10,
+        "lead_length": 12,
+        "remaining": 2,
+    }
+    assert p["accepted_changes"] == 10 and p["lead_end_changes"] == []
+    assert p["lead_methods"] == ["pb-minor"]
+    assert p["current_row"] == all_rows[9]
+
+    # 超出标注 lead 总 change 数仍拒绝
+    r2 = _explicit_prefix(client, all_rows[:13], 1)
+    assert r2.status_code == 422
+    err = r2.json()["prefix"]["first_error"]
     assert err["code"] == "PREFIX_LENGTH_MISMATCH"
 
 
@@ -271,19 +291,64 @@ def test_prefix_from_touch(client, pb_touch):
     assert len(p["lead_methods"]) == 3
 
 
-def test_prefix_from_touch_rejects_non_lead_end(client, pb_touch):
+def test_prefix_from_touch_mid_lead(client, pb_touch):
+    all_rows = _touch_rows(client, pb_touch)
+    r = client.post(
+        "/prefixes",
+        json={
+            "id": "ft",
+            "from_touch": {
+                "touch_id": "pc",
+                "touch_version": 1,
+                "up_to_change": 10,  # 位于第 1 个 lead 中途
+            },
+        },
+    )
+    assert r.status_code == 201, r.text
+    p = r.json()
+    assert p["source"] == {
+        "type": "touch",
+        "touch_id": "pc",
+        "touch_version": 1,
+        "up_to_change": 10,
+    }
+    assert p["accepted_changes"] == 10
+    assert p["current_row"] == all_rows[9]
+    assert len(p["lead_methods"]) == 1
+    assert p["partial_lead"]["consumed"] == 10
+    assert p["partial_lead"]["remaining"] == 2
+
+    # 续接：先强制敲完剩余 2 个 change，再扩展完整 lead；
+    # max_leads=1 时也应返回候选（强制段终点），并标 reached_target
+    d = client.post(
+        "/prefixes/ft/versions/1/continuation", json={"max_leads": 1}
+    ).json()
+    assert d["solutions_found"] >= 1
+    forced_only = [x for x in d["results"] if x["num_leads"] == 0]
+    assert len(forced_only) == 1
+    cand = forced_only[0]
+    assert cand["forced_remainder"]["remaining_changes"] == 2
+    assert cand["forced_remainder"]["method"] == "pb-minor"
+    assert len(cand["rows"]) == 2
+    assert cand["reached_target"] is False
+    assert cand["events"][0]["forced_remainder"] is True
+    assert cand["events"][0]["change"] == 11
+    assert cand["events"][0]["change_in_lead"] == 11
+
+
+def test_prefix_from_touch_out_of_range(client, pb_touch):
     r = client.post(
         "/prefixes",
         json={
             "from_touch": {
                 "touch_id": "pc",
                 "touch_version": 1,
-                "up_to_change": 10,
+                "up_to_change": 10_000,
             }
         },
     )
     assert r.status_code == 422
-    assert r.json()["detail"]["code"] == "CHANGE_NOT_LEAD_END"
+    assert r.json()["detail"]["code"] == "CHANGE_OUT_OF_RANGE"
 
 
 def test_prefix_from_touch_not_found(client):
@@ -311,7 +376,8 @@ def test_continuation_plain_course_completion(client, pb_touch):
     d = r.json()
     assert d["truncated"] is False and d["solutions_found"] >= 1
     best = d["results"][0]
-    # 剩余 2 个 plain lead 回到 rounds，是最短方案
+    # 剩余 2 个 plain lead 回到 rounds，是最短到达方案
+    assert best["reached_target"] is True
     assert best["num_leads"] == 2 and best["num_calls"] == 0
     assert best["rows"][-1] == "123456"
     assert [l["call"] for l in best["leads"]] == ["plain", "plain"]
@@ -320,9 +386,59 @@ def test_continuation_plain_course_completion(client, pb_touch):
     assert all(l["method_version"] == 1 for l in best["leads"])
     assert all(ev["method_id"] == "pb-minor" for ev in best["events"])
     assert best["events"][0]["lead"] == 4
-    # 排序：lead 数升序
-    keys = [(x["num_leads"], x["num_changes"], x["num_calls"]) for x in d["results"]]
+    # 同时返回上限内合法但未到目标的候选，且全部排在到达方案之后
+    not_target = [x for x in d["results"] if not x["reached_target"]]
+    assert not_target
+    assert all(not x["reached_target"] for x in d["results"][len([
+        x for x in d["results"] if x["reached_target"]
+    ]):])
+    # 稳定排序：到达目标 → lead 数 → call 数 → 拼接数 → change 数
+    keys = [
+        (not x["reached_target"], x["num_leads"], x["num_calls"],
+         x["num_splices"], x["num_changes"])
+        for x in d["results"]
+    ]
     assert keys == sorted(keys)
+    assert all(x["forced_remainder"] is None for x in d["results"])
+
+
+def test_continuation_mid_lead_forced_remainder(client, pb_touch):
+    # 显式提交 lead 中途前缀（10/12 change）
+    all_rows = _touch_rows(client, pb_touch)
+    p = _explicit_prefix(client, all_rows[:10], 1, id="midx")
+    assert p.status_code == 201
+    d = client.post(
+        "/prefixes/midx/versions/1/continuation", json={"max_leads": 4}
+    ).json()
+    # num_leads=0 的强制段候选：只含剩余 2 个 change，未到目标
+    forced = [x for x in d["results"] if x["num_leads"] == 0]
+    assert len(forced) == 1
+    cand = forced[0]
+    assert cand["reached_target"] is False
+    assert cand["rows"] == all_rows[10:12]
+    assert cand["forced_remainder"] == {
+        "lead": 1,
+        "method": "pb-minor",
+        "method_version": 1,
+        "call": "plain",
+        "remaining_changes": 2,
+        "end_row": all_rows[11],
+    }
+    assert [ev["forced_remainder"] for ev in cand["events"]] == [True, True]
+    assert cand["events"][0]["change_in_lead"] == 11
+    # 到达目标的方案：强制段 + 4 个完整 lead（剩余 plain course）
+    targets = [x for x in d["results"] if x["reached_target"]]
+    assert targets
+    best = targets[0]
+    assert best["num_leads"] == 4
+    assert best["rows"][-1] == "123456"
+    assert best["num_changes"] == 50  # 2 强制 + 48 完整 lead
+    # 完整 lead 的事件不带 forced 标记，全局 lead 号从 2 起
+    tail_events = [ev for ev in best["events"] if not ev["forced_remainder"]]
+    assert tail_events[0]["lead"] == 2
+    assert all(ev["forced_remainder"] is False for ev in tail_events)
+    # 所有候选都带 reached_target 布尔字段
+    assert all("reached_target" in x for x in d["results"])
 
 
 def test_continuation_deterministic_and_cached(client, pb_touch):
@@ -344,7 +460,31 @@ def test_continuation_deterministic_and_cached(client, pb_touch):
 
 
 def test_continuation_no_solution_reports_exhaustion(client, methods):
-    # 取一个 PB lead 做前缀，要求只能用 ALT 且 1 个 lead 回到 rounds
+    # 完整 plain course 前缀（已见全部 row），目标改成不可达排列：
+    # 任何尾段首 lead 都与前缀重复 → 一个合法候选都没有
+    r = client.post(
+        "/touches",
+        json={
+            "method_id": "pb-minor",
+            "calls": CALLS,
+            "sequence": [{"leads": [{"call": None}], "repeat": 5}],
+        },
+    )
+    rows = _touch_rows(client, r.json()["id"])
+    p = _explicit_prefix(client, rows, 5).json()
+    pid, pv = p["id"], p["version"]
+    d = client.post(
+        f"/prefixes/{pid}/versions/{pv}/continuation",
+        json={"max_leads": 1, "target_row": "654321"},
+    ).json()
+    assert d["solutions_found"] == 0 and d["truncated"] is False
+    assert "穷尽" in d["truncation_reason"]
+    assert d["checked_states"] >= 1
+    assert d["pruned_by_repeat"] > 0
+
+
+def test_non_target_candidates_visible_with_unreachable_min(client, methods):
+    # 部分 lead 前缀（10/12）；min 配额不可达时强制段候选仍在结果中
     r = client.post(
         "/touches",
         json={
@@ -354,25 +494,21 @@ def test_continuation_no_solution_reports_exhaustion(client, methods):
         },
     )
     rows = _touch_rows(client, r.json()["id"])
-    p = client.post(
-        "/prefixes",
-        json={
-            "stage": 6,
-            "methods": [{"id": "pb-minor"}],
-            "calls": CALLS,
-            "leads": [{"call": None}],
-            "rows": rows,
-        },
-    ).json()
+    p = _explicit_prefix(client, rows[:10], 1).json()
     pid, pv = p["id"], p["version"]
     d = client.post(
         f"/prefixes/{pid}/versions/{pv}/continuation",
-        json={"max_leads": 1, "methods": [{"id": "alt-minor"}]},
+        json={"max_leads": 2, "method_quotas": {"pb-minor": {"min": 99}}},
     ).json()
-    assert d["solutions_found"] == 0 and d["truncated"] is False
-    assert "穷尽" in d["truncation_reason"]
-    assert d["checked_states"] >= 1
-    assert d["deepest_progress"]["leads"] >= 0
+    assert d["solutions_found"] >= 1
+    assert all(x["reached_target"] is False for x in d["results"])
+    assert d["pruned_by_quota"] >= 1
+    # max 配额仍然约束未到目标候选：max=0 时不含完整 lead 的候选
+    d2 = client.post(
+        f"/prefixes/{pid}/versions/{pv}/continuation",
+        json={"max_leads": 2, "method_quotas": {"pb-minor": {"max": 0}}},
+    ).json()
+    assert all(x["num_leads"] == 0 for x in d2["results"])
 
 
 def test_continuation_truncation(client, pb_touch):
@@ -445,7 +581,7 @@ def test_continuation_boundary_transition_pruning(client, methods):
         },
     ).json()
     pid, pv = p["id"], p["version"]
-    # 白名单仅允许 pb->alt：根上 pb 被剪枝、alt 保留
+    # 白名单仅允许 pb->alt：根边界上 alt 可选，同方法 pb 延续始终允许
     d = client.post(
         f"/prefixes/{pid}/versions/{pv}/continuation",
         json={
@@ -453,16 +589,35 @@ def test_continuation_boundary_transition_pruning(client, methods):
             "allowed_transitions": [["pb-minor", "alt-minor"]],
         },
     ).json()
-    assert d["pruned_by_transition"] == 1  # 根边界处 pb 被剪枝
-    # 白名单仅允许 pb->pb：alt 被剪枝
+    assert d["pruned_by_transition"] == 0
+    # 白名单不含 pb->alt：第二层 alt 延续被剪枝（第一层 alt 已被挡住），
+    # pb 同方法延续始终允许
     d2 = client.post(
         f"/prefixes/{pid}/versions/{pv}/continuation",
         json={
-            "max_leads": 1,
+            "max_leads": 2,
             "allowed_transitions": [["pb-minor", "pb-minor"]],
         },
     ).json()
-    assert d2["pruned_by_transition"] == 1  # 根边界处 alt 被剪枝
+    assert d2["pruned_by_transition"] >= 1
+    assert any(
+        l["method"] == "pb-minor"
+        for x in d2["results"]
+        for l in x["leads"]
+    )
+    # 同方法连续 lead 不被白名单剪掉：只列跨方法转换时仍能找到同方法续接
+    d3 = client.post(
+        f"/prefixes/{pid}/versions/{pv}/continuation",
+        json={
+            "max_leads": 2,
+            "allowed_transitions": [["pb-minor", "alt-minor"], ["alt-minor", "pb-minor"]],
+        },
+    ).json()
+    same_method = [
+        x for x in d3["results"]
+        if x["num_leads"] >= 1 and all(l["method"] == "pb-minor" for l in x["leads"])
+    ]
+    assert same_method
 
 
 def test_continuation_music_sorting_and_threshold(client, methods):
@@ -504,11 +659,11 @@ def test_continuation_music_sorting_and_threshold(client, methods):
     ).json()
     assert "music_score" in d["sorted_by"]
     assert all("music_score" in x for x in d["results"])
-    # 稳定排序键：lead 数 → change 数 → call 数 → 拼接数 → 音乐分（高者优先）
+    # 稳定排序键：到达目标 → lead 数 → call 数 → 拼接数 → 音乐分（高者优先）
     keys = [
         (
+            not x["reached_target"],
             x["num_leads"],
-            x["num_changes"],
             x["num_calls"],
             x["num_splices"],
             -x["music_score"],

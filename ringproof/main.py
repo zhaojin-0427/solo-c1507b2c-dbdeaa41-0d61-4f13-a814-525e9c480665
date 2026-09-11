@@ -653,6 +653,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
             "seen_rows": replay["seen_rows"],
             "accepted_changes": replay["accepted_changes"],
             "lead_methods": replay["lead_methods"],
+            "partial_lead": replay["partial_lead"],
             "leads": [
                 {
                     "lead": i + 1,
@@ -754,6 +755,24 @@ def create_app(db_path: str | None = None) -> FastAPI:
             return err
         stage = state["stage"]
 
+        # 前缀止于 lead 中途时，强制段需要部分 lead 的方法定义；该方法记录
+        # （按前缀冻结版本）并入构建上下文，但不进入可自由选择的方法列表，
+        # 除非它本就在尾段方法中。
+        partial_state = state.get("partial_lead")
+        extra_ctx_methods: list[dict] = []
+        if partial_state is not None:
+            pm_id = partial_state["method_id"]
+            if not any(m["id"] == pm_id for m in tail_methods):
+                pm_version = partial_state["method_version"]
+                pm_rec = storage.get_method(pm_id, pm_version)
+                if not pm_rec:
+                    return JSONResponse(
+                        status_code=422,
+                        content={"detail": {"code": "METHOD_MISSING",
+                                            "message": f"部分 lead 引用的方法版本缺失: {pm_id} v{pm_version}"}},
+                    )
+                extra_ctx_methods.append(pm_rec)
+
         # call 定义：前缀 call 为底，请求 call 同名覆盖/新增
         call_specs, call_err = _merge_continuation_calls(state, body, tail_methods)
         if call_err is not None:
@@ -788,7 +807,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
 
         parsed = {}
         method_by_id = {}
-        for m in tail_methods:
+        for m in tail_methods + extra_ctx_methods:
             ch = json.loads(m["changes_json"])
             parsed[m["id"]] = (ch["tokens"], [frozenset(p) for p in ch["places"]])
             method_by_id[m["id"]] = m
@@ -855,6 +874,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
             "current_row": state["current_row"],
             "seen_rows": state["seen_rows"],
             "lead_methods": state["lead_methods"],
+            "partial_lead": state.get("partial_lead"),
             "max_leads": body.max_leads,
             "target_row": row_to_string(target),
             "methods": [
@@ -888,6 +908,21 @@ def create_app(db_path: str | None = None) -> FastAPI:
                 headers={"X-Continuation-Cache": "hit"},
             )
 
+        partial_arg = None
+        if partial_state is not None:
+            partial_arg = {
+                "method_id": partial_state["method_id"],
+                "call": partial_state["call"],
+                "skip": partial_state["consumed"],
+                "lead_length": partial_state["lead_length"],
+            }
+            if partial_arg["call"] is not None and partial_arg["call"] not in call_defs:
+                return JSONResponse(
+                    status_code=422,
+                    content={"detail": {"code": "UNKNOWN_CALL",
+                                        "message": f"部分 lead 的 call {partial_arg['call']!r} 未在可用 call 中定义"}},
+                )
+
         search = search_continuations(
             ctx,
             start_row,
@@ -901,16 +936,23 @@ def create_app(db_path: str | None = None) -> FastAPI:
             quotas=quotas,
             allowed=allowed,
             forbidden=forbidden,
+            partial=partial_arg,
             music_rules=music_rules,
             music_flags=music_flags,
             min_music_score=body.min_music_score,
             min_music_hits=body.min_music_hits,
             prefix_changes=state["accepted_changes"],
         )
-        if not search["truncated"] and search["solutions_found"] == 0:
+        if (
+            not search["truncated"]
+            and search["solutions_found"] == 0
+            and not search.get("forced_remainder_impossible")
+        ):
             search["truncation_reason"] = "搜索空间穷尽，未发现满足全部约束的续接方案"
+        elif search.get("forced_remainder_impossible"):
+            search["truncation_reason"] = search["forced_remainder_impossible"]
 
-        sorted_by = ["target_reached", "num_leads", "num_changes", "num_calls", "num_splices"]
+        sorted_by = ["target_reached", "num_leads", "num_calls", "num_splices", "num_changes"]
         if scheme is not None:
             sorted_by.append("music_score")
         payload = {
@@ -1185,28 +1227,31 @@ def create_app(db_path: str | None = None) -> FastAPI:
                 ctx["start_row"],
             )
             lead_end_changes = _lead_end_changes(leads_resolved)
-            if ref.up_to_change not in lead_end_changes:
+            if not 1 <= ref.up_to_change <= lead_end_changes[-1]:
                 return None, JSONResponse(
                     status_code=422,
                     content={
                         "detail": {
-                            "code": "CHANGE_NOT_LEAD_END",
+                            "code": "CHANGE_OUT_OF_RANGE",
                             "message": (
-                                f"change {ref.up_to_change} 不是 lead end；"
-                                f"该 touch 的 lead end change 为 {lead_end_changes}"
+                                f"change {ref.up_to_change} 超出 touch 范围"
+                                f"（1..{lead_end_changes[-1]}）"
                             ),
                         }
                     },
                 )
             methods = list(ctx["methods"])
-            # 截止 change 落在的 lead 序号
+            # 截止 change 所在 lead 及其已敲 change 数（允许止于 lead 中途）
             cut_lead = 0
             cum = 0
+            consumed = 0
             for i, l in enumerate(leads_resolved, 1):
-                cum += len(l.tokens)
-                if cum == ref.up_to_change:
+                lead_len = len(l.tokens)
+                if ref.up_to_change <= cum + lead_len:
                     cut_lead = i
+                    consumed = ref.up_to_change - cum
                     break
+                cum += lead_len
             events = result["events"][: ref.up_to_change]
             rows = [ev["row"] for ev in events]
             labels = [
@@ -1311,6 +1356,8 @@ def create_app(db_path: str | None = None) -> FastAPI:
             "permutation_complete": replay["permutation_complete"],
             "lead_methods": replay["lead_methods"],
             "lead_end_changes": replay["lead_end_indices"],
+            "partial_lead": replay["partial_lead"],
+            "ends_at_lead_end": replay["partial_lead"] is None,
             "seen_rows": replay["seen_rows"],
             "frozen": {
                 "current_row": replay["current_row"],

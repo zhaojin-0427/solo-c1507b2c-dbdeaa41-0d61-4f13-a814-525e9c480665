@@ -250,18 +250,19 @@ class PrefixLead(BaseModel):
 
 
 class PrefixFromTouch(BaseModel):
-    """引用不可变 touch 的指定 change 作为前缀（该 change 须位于 lead end）。"""
+    """引用不可变 touch 的指定 change 作为前缀（可位于 lead 中途）。"""
 
     touch_id: str
     touch_version: int = Field(ge=1)
-    up_to_change: int = Field(ge=1, description="前缀截止的 change 序号（须为某个 lead end）")
+    up_to_change: int = Field(ge=1, description="前缀截止的 change 序号（可在 lead 中途，续接时先强制敲完该 lead 剩余 change）")
 
 
 class PrefixCreate(BaseModel):
     """提交部分 touch：显式 rows+leads，或引用不可变 touch 的指定 change。
 
-    显式模式下 ``rows`` 为不含起始 row 的逐 change row，长度须等于各标注
-    lead 的 change 数之和（前缀须止于 lead end）。
+    显式模式下 ``rows`` 为不含起始 row 的逐 change row，长度可为 1..各标注
+    lead 的 change 总数之间的任意值——止于最后一个标注 lead 的中途时，
+    该 lead 记为部分 lead（``partial_lead``），续接时先强制敲完其剩余 change。
     """
 
     id: str | None = Field(default=None, description="留空则自动生成；同名 id 递增版本")
