@@ -910,18 +910,27 @@ def create_app(db_path: str | None = None) -> FastAPI:
 
         partial_arg = None
         if partial_state is not None:
+            # 完成被冻结的部分 lead 时，沿用前缀保存时的 call 定义；续接请求
+            # 中对同名 call 的覆盖只用于后续新增 lead，不影响这段强制余段。
+            pm_id = partial_state["method_id"]
+            frozen_call = partial_state["call"]
+            frozen_lead = build_lead(
+                *ctx["parsed"][pm_id],
+                frozen_call,
+                _frozen_call_defs(state["calls"], stage),
+                method_id=pm_id,
+                method_version=partial_state["method_version"],
+                method_name=ctx["method_by_id"][pm_id]["name"],
+            )
             partial_arg = {
-                "method_id": partial_state["method_id"],
-                "call": partial_state["call"],
+                "method_id": pm_id,
+                "method_version": partial_state["method_version"],
+                "method_name": ctx["method_by_id"][pm_id]["name"],
+                "call": frozen_call,
                 "skip": partial_state["consumed"],
-                "lead_length": partial_state["lead_length"],
+                "tokens": frozen_lead.tokens,
+                "changes": [sorted(p) for p in frozen_lead.changes],
             }
-            if partial_arg["call"] is not None and partial_arg["call"] not in call_defs:
-                return JSONResponse(
-                    status_code=422,
-                    content={"detail": {"code": "UNKNOWN_CALL",
-                                        "message": f"部分 lead 的 call {partial_arg['call']!r} 未在可用 call 中定义"}},
-                )
 
         search = search_continuations(
             ctx,
@@ -1103,6 +1112,24 @@ def create_app(db_path: str | None = None) -> FastAPI:
                 else None
             ),
         }
+
+    def _frozen_call_defs(saved_calls: dict[str, dict], stage: int) -> dict[str, dict]:
+        """用前缀状态中冻结的 call 定义重建 build_lead 所需 call_defs。
+
+        续接请求对同名 call 的覆盖不参与此处展开，保证被冻结部分 lead 的
+        强制余段与前缀创建时完全一致。
+        """
+        defs: dict[str, dict] = {}
+        for name, spec in saved_calls.items():
+            ctoks, cchanges = expand_notation(spec["notation"], stage)
+            defs[name] = {
+                "notation": spec["notation"],
+                "normalized": ".".join(ctoks),
+                "tokens": ctoks,
+                "changes": cchanges,
+                "replace": spec["replace"],
+            }
+        return defs
 
     def _build_call_defs(
         calls_in: dict, stage: int, methods: list[dict]

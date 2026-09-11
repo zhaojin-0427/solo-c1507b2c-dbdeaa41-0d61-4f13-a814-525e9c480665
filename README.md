@@ -221,10 +221,10 @@ rounds 属正常回归）。校核失败返回 422 `PREFIX_INVALID`，响应体 
 | `max_leads` | 剩余 lead 数上限（默认 12） |
 | `target_row` | 目标 row（缺省 rounds），须出现在尾段末 row |
 | `methods` | 尾段可用方法；缺省沿用前缀方法（版本随前缀冻结） |
-| `calls` | 尾段可用 call；以前缀 call 为底、同名覆盖/新增 |
+| `calls` | 尾段新增 lead 的可用 call；以前缀 call 为底、同名覆盖/新增。**同名覆盖不影响部分 lead 的强制余段**（始终用前缀冻结时的 call 定义） |
 | `max_calls` | 尾段 call 数上限 |
-| `method_quotas` | 各方法尾段用量 min/max（按尾段 lead 计，**不**计前缀用量） |
-| `allowed_transitions` / `forbidden_transitions` | 相邻方法转换白/黑名单；同时约束前缀末 lead → 尾段首 lead |
+| `method_quotas` | 各方法尾段用量 min/max（按尾段 lead 计，**不**计前缀用量与强制完成的部分 lead） |
+| `allowed_transitions` / `forbidden_transitions` | 相邻方法转换白/黑名单；**同时约束前缀末 lead 方法 → 第一个尾段 lead 方法**，同方法延续始终允许（白名单只约束跨方法转换） |
 | `max_results` / `max_search` | 返回方案上限（默认 50）/ 搜索状态预算（默认 20000） |
 | `music` + `min_music_score` / `min_music_hits` | 引用评分方案（版本随前缀冻结）与门槛 |
 
@@ -238,12 +238,14 @@ change），之后每个完整 lead 末端都入 `results`——**无论是否�
 未到目标候选以 `reached_target: false` 标记并排到所有到达方案之后。每个结果：
 
 - `forced_remainder` — 部分 lead 的强制剩余段（方法、版本、call、剩余
-  change 数与强制段末 row）；无部分 lead 时为 null；
+  change 数与强制段末 row），其记号沿用前缀冻结时的 call 定义，不受续接
+  请求中同名 call 覆盖影响；无部分 lead 时为 null；
 - `leads` — 尾段完整 lead，逐个标明 `lead`（全局序号）、
   `method`/`method_version`、`call`；
 - `rows` / `events` — 强制段+尾段的逐 row 与逐 change 来源（全局 change
   编号、lead、记号、方法 id/版本、call、`forced_remainder`/`splice` 标记）；
-- `num_leads` / `num_changes` / `num_calls` / `num_splices`（拼接含前缀边界）；
+- `num_leads` / `num_changes` / `num_calls` / `num_splices`（`num_splices`
+  与逐 row 事件的 `splice` 标记一致，含前缀末 lead → 第一个尾段 lead 的边界拼接）；
 - `method_counts` 与 `quota_remaining`（各方法已用/剩余 min/max）；
 - `reached_target` / `target_row` 与 `music_score` / `music_hits`（引用方案时）。
 
@@ -332,5 +334,5 @@ curl -X POST localhost:8765/prefixes -H 'Content-Type: application/json' -d \
 ## 测试
 
 ```bash
-python3 -m pytest tests/ -q   # 106 个用例
+python3 -m pytest tests/ -q   # 108 个用例
 ```

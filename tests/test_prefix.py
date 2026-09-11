@@ -581,7 +581,7 @@ def test_continuation_boundary_transition_pruning(client, methods):
         },
     ).json()
     pid, pv = p["id"], p["version"]
-    # 白名单仅允许 pb->alt：根边界上 alt 可选，同方法 pb 延续始终允许
+    # 白名单仅允许 pb->alt：根边界上 alt 可选（剪枝计数为 0），同方法 pb 也始终允许
     d = client.post(
         f"/prefixes/{pid}/versions/{pv}/continuation",
         json={
@@ -590,8 +590,25 @@ def test_continuation_boundary_transition_pruning(client, methods):
         },
     ).json()
     assert d["pruned_by_transition"] == 0
-    # 白名单不含 pb->alt：第二层 alt 延续被剪枝（第一层 alt 已被挡住），
-    # pb 同方法延续始终允许
+    assert {
+        x["leads"][0]["method"] for x in d["results"] if x["num_leads"] == 1
+    } == {"pb-minor", "alt-minor"}
+
+    # 白名单只有 alt->pb（缺 pb->alt）：前缀末方法为 pb，alt 不能作为
+    # 第一个尾段 lead，只有同方法 pb 延续
+    d_alt = client.post(
+        f"/prefixes/{pid}/versions/{pv}/continuation",
+        json={
+            "max_leads": 2,
+            "allowed_transitions": [["alt-minor", "pb-minor"]],
+        },
+    ).json()
+    assert d_alt["pruned_by_transition"] >= 1
+    for x in d_alt["results"]:
+        if x["num_leads"] >= 1:
+            assert x["leads"][0]["method"] == "pb-minor"
+
+    # 白名单不含 pb->alt：alt 在根边界被剪枝，pb 同方法延续始终允许
     d2 = client.post(
         f"/prefixes/{pid}/versions/{pv}/continuation",
         json={
@@ -600,11 +617,9 @@ def test_continuation_boundary_transition_pruning(client, methods):
         },
     ).json()
     assert d2["pruned_by_transition"] >= 1
-    assert any(
-        l["method"] == "pb-minor"
-        for x in d2["results"]
-        for l in x["leads"]
-    )
+    for x in d2["results"]:
+        if x["num_leads"] >= 1:
+            assert x["leads"][0]["method"] == "pb-minor"
     # 同方法连续 lead 不被白名单剪掉：只列跨方法转换时仍能找到同方法续接
     d3 = client.post(
         f"/prefixes/{pid}/versions/{pv}/continuation",
@@ -618,6 +633,135 @@ def test_continuation_boundary_transition_pruning(client, methods):
         if x["num_leads"] >= 1 and all(l["method"] == "pb-minor" for l in x["leads"])
     ]
     assert same_method
+
+
+def test_boundary_splice_count_matches_row_flags(client, methods):
+    """前缀末 lead 方法参与首尾段 lead 的转换：num_splices 与逐 row splice 一致。"""
+    r = client.post(
+        "/touches",
+        json={
+            "method_id": "pb-minor",
+            "calls": CALLS,
+            "sequence": [{"leads": [{"call": None}]}],
+        },
+    )
+    rows = _touch_rows(client, r.json()["id"])
+    p = client.post(
+        "/prefixes",
+        json={
+            "stage": 6,
+            "methods": [{"id": "pb-minor"}, {"id": "alt-minor"}],
+            "calls": CALLS,
+            "leads": [{"method": "pb-minor"}],
+            "rows": rows,
+        },
+    ).json()
+    pid, pv = p["id"], p["version"]
+    d = client.post(
+        f"/prefixes/{pid}/versions/{pv}/continuation",
+        json={
+            "max_leads": 1,
+            "allowed_transitions": [["pb-minor", "alt-minor"]],
+        },
+    ).json()
+    alt_lead = [
+        x for x in d["results"]
+        if x["num_leads"] == 1 and x["leads"][0]["method"] == "alt-minor"
+    ]
+    assert alt_lead
+    cand = alt_lead[0]
+    # 跨方法边界：num_splices=1，且该尾段每个 row 事件 splice=true
+    assert cand["num_splices"] == 1
+    assert all(ev["splice"] is True for ev in cand["events"])
+    # 同方法延续：num_splices=0 且逐 row splice=false
+    pb_lead = [
+        x for x in d["results"]
+        if x["num_leads"] == 1 and x["leads"][0]["method"] == "pb-minor"
+    ]
+    assert pb_lead
+    assert pb_lead[0]["num_splices"] == 0
+    assert all(ev["splice"] is False for ev in pb_lead[0]["events"])
+
+
+def test_partial_frozen_call_not_affected_by_override(client, methods):
+    """部分 bob lead 的强制余段沿用冻结的 call 定义；请求中同名覆盖只用于新 lead。"""
+    r = client.post(
+        "/touches",
+        json={
+            "method_id": "pb-minor",
+            "calls": CALLS,
+            "sequence": [{"leads": [{"call": "bob"}]}],
+        },
+    )
+    rows = _touch_rows(client, r.json()["id"])
+    assert rows[-1] == "123564"  # bob=14 的 lead end
+    # 前缀停在 bob lead 的第 11 个 change
+    p = client.post(
+        "/prefixes",
+        json={
+            "stage": 6,
+            "methods": [{"id": "pb-minor"}],
+            "calls": CALLS,
+            "leads": [{"call": "bob"}],
+            "rows": rows[:11],
+        },
+    )
+    assert p.status_code == 201, p.text
+    pj = p.json()
+    pid, pv = pj["id"], pj["version"]
+    assert pj["partial_lead"]["call"] == "bob"
+    assert pj["partial_lead"]["remaining"] == 1
+
+    d = client.post(
+        f"/prefixes/{pid}/versions/{pv}/continuation",
+        json={
+            "max_leads": 1,
+            "calls": {"bob": {"notation": "16", "replace": 1}},  # 同名覆盖
+        },
+    ).json()
+    forced_only = [x for x in d["results"] if x["num_leads"] == 0]
+    assert len(forced_only) == 1
+    cand = forced_only[0]
+    # 强制余段仍是冻结 touch 的 bob=14 结果，而非覆盖后的 16
+    assert cand["rows"] == ["123564"]
+    assert cand["events"][0]["notation"] == "14"
+    assert cand["events"][0]["source"] == "call:bob"
+    assert cand["reached_target"] is False  # 123564 不是 rounds
+    assert cand["events"][0]["forced_remainder"] is True
+    # 覆盖后的 bob=16 从该强制段末 row 开新 lead 会立即撞回 123564（重复），
+    # 此场景下新 bob lead 被重复剪枝
+    assert not [
+        x for x in d["results"]
+        if x["num_leads"] == 1 and x["leads"][0]["call"] == "bob"
+    ]
+    assert d["pruned_by_repeat"] >= 1
+
+    # 用 1234 覆盖同名 bob：强制余段仍是冻结的 14，而新增 lead 的
+    # lead end 记号使用覆盖后的 1234
+    d2 = client.post(
+        f"/prefixes/{pid}/versions/{pv}/continuation",
+        json={
+            "max_leads": 1,
+            "calls": {"bob": {"notation": "1234", "replace": 1}},
+        },
+    ).json()
+    forced2 = [x for x in d2["results"] if x["num_leads"] == 0]
+    assert forced2 and forced2[0]["events"][0]["notation"] == "14"
+    assert forced2[0]["rows"] == ["123564"]
+    new_bob = [
+        x for x in d2["results"]
+        if x["num_leads"] == 1 and x["leads"][0]["call"] == "bob"
+    ]
+    assert new_bob
+    tail_last = [
+        ev for ev in new_bob[0]["events"]
+        if not ev["forced_remainder"] and ev["change_in_lead"] == 12
+    ]
+    assert tail_last and tail_last[0]["notation"] == "1234"
+    # 强制段记号不受影响
+    assert new_bob[0]["forced_remainder"]["call"] == "bob"
+    forced_events = [e for e in new_bob[0]["events"] if e["forced_remainder"]]
+    assert forced_events and forced_events[0]["notation"] == "14"
 
 
 def test_continuation_music_sorting_and_threshold(client, methods):

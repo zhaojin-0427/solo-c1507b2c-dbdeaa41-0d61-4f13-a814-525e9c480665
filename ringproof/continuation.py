@@ -106,9 +106,10 @@ def search_continuations(
 ) -> dict:
     """在前缀之后搜索续接尾段。结果对同一输入完全确定。
 
-    ``partial`` 非 None 时形如 ``{"method_id", "call", "skip",
-    "lead_length"}``：前缀在该 lead 内已敲 skip 个 change，搜索先强制施加
-    该 lead 剩余（lead_length - skip）个 change。
+    ``partial`` 非 None 时形如 ``{"method_id", "method_version", "method_name",
+    "call", "skip", "tokens", "changes"}``：前缀在该 lead 内已敲 skip 个
+    change，搜索先用 **前缀冻结时的记号**（tokens/changes 已按保存的 call
+    定义展开，不受续接请求中同名 call 覆盖影响）强制施加剩余 change。
     """
     methods = ctx["method_ids"]
     call_opts = _call_options(ctx)
@@ -130,7 +131,7 @@ def search_continuations(
         outcome_cache[key] = res
         return res
 
-    # ---------- 强制敲完部分 lead 的剩余 change ----------
+    # ---------- 强制敲完部分 lead 的剩余 change（沿用前缀冻结记号） ----------
     forced = None
     forced_error: str | None = None
     forced_seen: frozenset[tuple[int, ...]] = frozenset()
@@ -138,8 +139,16 @@ def search_continuations(
     if partial is not None:
         mid = partial["method_id"]
         call = partial["call"]
-        full_lead = _build_lead(ctx, mid, call)
-        rest = full_lead.changes[partial["skip"] :]
+        frozen_lead = ExpandedLead(
+            call=call,
+            tokens=list(partial["tokens"]),
+            changes=[frozenset(p) for p in partial["changes"]],
+            method_id=mid,
+            method_version=partial.get("method_version"),
+            method_name=partial.get("method_name"),
+        )
+        skip = partial["skip"]
+        rest = frozen_lead.changes[skip:]
         cur = start_row
         forced_rows: list[tuple[int, ...]] = []
         for places in rest:
@@ -147,8 +156,11 @@ def search_continuations(
             forced_rows.append(cur)
         forced = {
             "method_id": mid,
+            "method_version": frozen_lead.method_version,
+            "method_name": frozen_lead.method_name,
             "call": call,
-            "skip": partial["skip"],
+            "skip": skip,
+            "lead": frozen_lead,
             "rows": forced_rows,
             "end_row": cur,
             "num_changes": len(rest),
@@ -202,7 +214,7 @@ def search_continuations(
         change_counter = 0
 
         if forced is not None:
-            full_lead = _build_lead(ctx, forced["method_id"], forced["call"])
+            full_lead = forced["lead"]
             for off, places in enumerate(full_lead.changes[forced["skip"] :]):
                 pos = forced["skip"] + off + 1
                 cur = apply_change(cur, places)
@@ -457,7 +469,12 @@ def search_continuations(
                     quota_remaining=_quota_remaining(quotas, {}),
                 )
                 collect(zero)
-            dfs(start_row, None, {}, frozenset(seen_rows), [], 0, 0, 0)
+            # 第一个尾段 lead 与前缀末 lead 之间同样做转换判断与拼接计数
+            boundary_last = prefix_methods[-1] if prefix_methods else None
+            dfs(
+                start_row, boundary_last, {}, frozenset(seen_rows),
+                [], 0, 0, 0,
+            )
 
     results = []
     for spec in found:
