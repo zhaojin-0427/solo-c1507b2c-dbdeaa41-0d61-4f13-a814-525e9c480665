@@ -67,10 +67,12 @@ python3 -m uvicorn ringproof.main:app --port 8765
 | POST | `/touches` | 创建 touch 版本（起始排列、calls、lead 顺序、max_calls、多方法拼接、配额与转换规则） |
 | GET | `/touches/{id}/versions/{v}` | 规范化后的 touch 与输入哈希 |
 | GET | `/touches/{id}/versions/{v}/rows` | 逐行来源（change、lead、记号、方法 id/版本、call 与拼接标记），支持分页 |
-| POST | `/touches/{id}/versions/{v}/prove` | 序列证明，可引用评分方案（按版本+方案缓存，`X-Proof-Cache` 头标识命中） |
-| POST | `/touches/{id}/versions/{v}/enumerate` | 枚举 call×method 候选组合（配额/转换剪枝、音乐门槛过滤、排序、截断说明） |
+| POST | `/touches/{id}/versions/{v}/prove` | 序列证明，可引用评分方案与 all-the-work 覆盖方案（按版本+方案缓存，`X-Proof-Cache` 头标识命中） |
+| POST | `/touches/{id}/versions/{v}/enumerate` | 枚举 call×method 候选组合（配额/转换剪枝、音乐/覆盖门槛过滤、排序、截断说明） |
 | POST | `/music-schemes` | 创建评分方案版本（指定钟数；同 id 递增版本，不可变） |
 | GET | `/music-schemes/{id}/versions/{v}` | 方案规则、计分开关与输入哈希 |
+| POST | `/coverage-schemes` | 创建 all-the-work 覆盖方案版本（工作钟、方法版本、逐格最低 lead 次数；同 id 递增版本） |
+| GET | `/coverage-schemes/{id}/versions/{v}` | 展开后的要求格、冻结方法版本与输入哈希 |
 | POST | `/prefixes` | 提交部分 touch 前缀（显式 rows+leads，或 from_touch 引用任意 change，可在 lead 中途）并重放校核 |
 | GET | `/prefixes/{id}/versions/{v}` | 前缀冻结状态（当前排列、已出现 row、lead 方法、依赖版本、逐行事件） |
 | GET | `/prefixes/{id}/versions/{v}/rows` | 前缀逐行来源（分页） |
@@ -188,6 +190,58 @@ rounds 是否计分由方案的 `score_start_row` / `score_final_rounds` 指定�
 在配额、转换、max_calls 筛选之后按门槛过滤（计数 `filtered_by_music`），
 变体按 **真值 → rounds 回归 → 音乐分（高者优先）→ 既有排序项** 稳定排序，
 每个变体携带 `music_score` / `music_hits`。设置门槛时必须引用方案。
+
+### all-the-work 覆盖分析
+
+覆盖方案按钟数创建、版本不可变：`working_bells` 选定工作钟，`methods`
+列出每个工作钟应经历的方法版本（`version` 留空则冻结为创建时最新版本），
+`cells` 逐格设置最低 lead 次数；`place_bell` 留空表示全部 place-bell 类别
+（1..stage），保存时展开为逐类别格。
+
+```json
+{
+  "id": "atw-minor", "name": "Minor all-the-work", "stage": 6,
+  "working_bells": [2, 3, 4, 5, 6],
+  "methods": [{"id": "pb-minor"}],
+  "cells": [
+    {"bell": 2, "method": "pb-minor", "place_bell": 4, "min_leads": 1}
+  ]
+}
+```
+
+- **place-bell 语义**：一口钟在某 lead 中敲第 p 号 place bell，当且仅当该
+  lead 开始前的实际排列（lead head）中这口钟位于第 p 个位置。因此 call
+  改变后续 lead head 后，各钟的 place-bell 归属自动按实际位置计数。
+- 创建时拒绝（不落库）：重复格 `DUPLICATE_CELL`（含展开后类别相交）、
+  越界/重复工作钟、覆盖格引用 `working_bells`/`methods` 之外的钟或方法、
+  `COVERAGE_STAGE_MISMATCH`（方法钟数与方案不一致）、方法版本缺失（404）。
+- 接口：`POST /coverage-schemes`、`GET /coverage-schemes`、
+  `GET /coverage-schemes/{id}`、`GET /coverage-schemes/{id}/versions/{v}`。
+
+证明时在请求体引用：`POST /touches/{id}/versions/{v}/prove`
+`{"coverage": {"id": "atw-minor"}}`（`version` 留空则随 touch 版本冻结为
+首次使用时的最新版本）。结果新增 `coverage` 段：
+
+- `matrix` — bell×method×place-bell 覆盖矩阵：每格 `count`（覆盖 lead 数）、
+  `first_lead` / `last_lead`（首次/末次出现的 lead）、`gaps` / `longest_gap`
+  （相邻出现的 lead 间隔）、`required`；
+- `cells` — 方案要求格与观测连接：附加 `min_leads`、`deficit`（未达最低
+  次数的缺口）、`satisfied`；
+- `missing_cells`（从未出现的要求格）/ `deficits`（未达标格）；
+- `bells` — 各工作钟完成率、要求/观测/封顶 lead 数与满足格数；
+- `completion`（按最低 lead 次数封顶的总完成率）、`cell_completion`（满足
+  格占比）、`balance`（各钟完成率极差，越小越均衡）、`full_coverage`；
+- `unmatched_methods` — 使用了方案外方法（id 或版本不符）的 lead，不计入矩阵。
+
+枚举时可引用覆盖方案并要求 `require_full_coverage`（仅保留全覆盖变体）或
+设置 `min_completion`（0~1 最低完成率，边界值达标）：不达标变体在既有
+约束筛选之后被过滤（计数 `filtered_by_coverage`），变体按
+**覆盖完成率（高者优先）→ 覆盖均衡度（极差小者优先）→（音乐分）→
+真值 → rounds 回归 → 既有排序项** 稳定排序，每个变体携带紧凑的 `coverage`
+指标。设置门槛时必须引用方案。
+
+覆盖方案版本随 touch 冻结，证明结果按 (touch 版本, 音乐方案, 覆盖方案)
+六元组缓存：重复证明命中缓存且与枚举中该变体的覆盖结果一致。
 
 ## 部分 touch：前缀校核与续接
 
@@ -423,6 +477,27 @@ curl -X POST localhost:8765/touches/spliced/versions/1/enumerate \
   -d '{"music":{"id":"music-6"},"min_music_score":10}'
 # → sorted_by 以 music_score 优先于拼接数，filtered_by_music 给出被过滤数量
 
+# 8b. 创建 all-the-work 覆盖方案：工作钟 2，在方法下敲全部 place-bell 类别各 ≥1 lead
+curl -X POST localhost:8765/coverage-schemes -H 'Content-Type: application/json' -d \
+  '{"id":"atw-2","name":"钟2 all-the-work","stage":6,
+    "working_bells":[2],"methods":[{"id":"pb-minor"}],
+    "cells":[{"bell":2,"method":"pb-minor","min_leads":1}]}'
+# → cells 展开为 place_bell 1..6 六格（1 号类别在 Plain Bob 中钟 2 不会敲到）
+
+# 8c. 证明时引用覆盖方案：bell×method×place-bell 矩阵、首末次 lead、缺口、完成率
+curl -X POST localhost:8765/touches/pc/versions/1/prove \
+  -H 'Content-Type: application/json' -d '{"coverage":{"id":"atw-2"}}'
+# → coverage.matrix 每格含 count/first_lead/last_lead/gaps；钟 2 覆盖 2/4/6/5/3
+#   completion 5/6，missing_cells=[place_bell 1]，bells 给出各钟完成率
+# 重复证明命中缓存（X-Proof-Cache: hit）；方案版本随该 touch 冻结
+
+# 8d. 枚举时按覆盖门槛过滤：仅保留全覆盖变体，其余计入 filtered_by_coverage
+curl -X POST localhost:8765/touches/spliced/versions/1/enumerate \
+  -H 'Content-Type: application/json' \
+  -d '{"coverage":{"id":"atw-2"},"require_full_coverage":true}'
+# → sorted_by 以 coverage_completion、coverage_balance 开头；
+#   也可改用 "min_completion":0.9 设最低完成率（边界值达标）
+
 # 9. 提交已敲出的 3 个 plain lead（36 row）前缀，按 lead 标注方法/call
 curl -X POST localhost:8765/prefixes -H 'Content-Type: application/json' -d \
   '{"id":"pfx","stage":6,"methods":[{"id":"pb-minor"}],
@@ -446,5 +521,5 @@ curl -X POST localhost:8765/prefixes -H 'Content-Type: application/json' -d \
 ## 测试
 
 ```bash
-python3 -m pytest tests/ -q   # 148 个用例
+python3 -m pytest tests/ -q   # 166 个用例
 ```

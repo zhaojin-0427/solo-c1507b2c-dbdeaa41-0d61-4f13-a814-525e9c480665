@@ -204,10 +204,73 @@ class MusicRef(BaseModel):
     version: int | None = Field(default=None, ge=1, description="留空则引用该方案的最新版本（随 touch 冻结）")
 
 
+class CoverageCellReq(BaseModel):
+    """all-the-work 覆盖方案中的一个要求格：某工作钟在某方法下须至少敲
+    ``min_leads`` 次指定 place-bell 类别；``place_bell`` 留空表示全部
+    place-bell 类别（1..stage），保存时展开为逐类别格。"""
+
+    bell: int = Field(ge=1, le=12, description="工作钟钟号")
+    method: str = Field(description="方法 id（须在方案的 methods 列表中）")
+    place_bell: int | None = Field(
+        default=None, ge=1, le=12,
+        description="place-bell 类别（钟在 lead 开始前的位置，1 起）；null 表示全部类别",
+    )
+    min_leads: int = Field(default=1, ge=1, description="该格要求的最少 lead 次数")
+
+
+class CoverageSchemeCreate(BaseModel):
+    """创建 all-the-work 覆盖方案版本（不可变，按方法版本冻结）。
+
+    方案按钟数创建：``working_bells`` 选定工作钟（钟号 1..stage，须唯一），
+    ``methods`` 给出每个工作钟应经历的方法版本（version 留空则冻结为最新），
+    ``cells`` 逐格设置最低 lead 次数；``place_bell`` 留空表示全部 place-bell
+    类别。重复格、越界钟号或方法钟数不一致由服务端拒绝（不落库）。
+    """
+
+    id: str | None = Field(default=None, description="留空则自动生成；同名 id 递增版本")
+    name: str = Field(min_length=1, max_length=200)
+    stage: int = Field(description="钟数，4~12")
+    working_bells: list[int] = Field(min_length=1, max_length=12, description="工作钟钟号列表（1..stage，须唯一）")
+    methods: list[MethodRef] = Field(min_length=1, description="覆盖分析覆盖的方法版本列表（同钟数，id 须唯一）")
+    cells: list[CoverageCellReq] = Field(min_length=1, description="覆盖要求格（每格一个 钟×方法×place-bell 最低次数）")
+
+    @model_validator(mode="after")
+    def _check(self) -> "CoverageSchemeCreate":
+        if not 4 <= self.stage <= 12:
+            raise ValueError("钟数 stage 须为 4~12")
+        if len(set(self.working_bells)) != len(self.working_bells):
+            raise ValueError("working_bells 存在重复钟号")
+        if any(not 1 <= b <= self.stage for b in self.working_bells):
+            raise ValueError(f"working_bells 钟号须在 1..{self.stage} 范围内")
+        method_ids = [m.id for m in self.methods]
+        if len(set(method_ids)) != len(method_ids):
+            raise ValueError("methods 列表存在重复的方法 id")
+        valid_bells = set(self.working_bells)
+        for c in self.cells:
+            if c.bell not in valid_bells:
+                raise ValueError(f"覆盖格的钟号 {c.bell} 不在 working_bells 中")
+            if c.method not in method_ids:
+                raise ValueError(f"覆盖格引用了 methods 列表外的方法: {c.method!r}")
+            if c.place_bell is not None and not 1 <= c.place_bell <= self.stage:
+                raise ValueError(f"place_bell {c.place_bell} 超出 1..{self.stage} 范围")
+        # 注：展开 place-bell 类别（None→全部）后的重复格由服务端在方法版本
+        # 冻结后检测并以 DUPLICATE_CELL 拒绝（错误响应带机器可读 code）。
+        return self
+
+
+class CoverageRef(BaseModel):
+    """引用一个 all-the-work 覆盖方案的不可变版本；version 留空则随 touch
+    冻结为首次使用时的最新版本。"""
+
+    id: str
+    version: int | None = Field(default=None, ge=1, description="留空则引用该方案的最新版本（随 touch 冻结）")
+
+
 class ProveRequest(BaseModel):
-    """证明请求：可引用音乐评分方案，结果附带音乐评分。"""
+    """证明请求：可引用音乐评分方案与 all-the-work 覆盖方案。"""
 
     music: MusicRef | None = Field(default=None, description="音乐评分方案引用（留空则不评分）")
+    coverage: CoverageRef | None = Field(default=None, description="all-the-work 覆盖方案引用（留空则不分析）")
 
 
 class EnumerateRequest(BaseModel):
@@ -222,11 +285,21 @@ class EnumerateRequest(BaseModel):
     music: MusicRef | None = Field(default=None, description="音乐评分方案引用（留空则不评分）")
     min_music_score: int | None = Field(default=None, description="音乐总分门槛：低于该值的变体被过滤")
     min_music_hits: int | None = Field(default=None, ge=0, description="规则命中数门槛：总命中数低于该值的变体被过滤")
+    coverage: CoverageRef | None = Field(default=None, description="all-the-work 覆盖方案引用（留空则不分析覆盖）")
+    require_full_coverage: bool = Field(default=False, description="仅保留全覆盖（每个要求格满足 min_leads）的变体")
+    min_completion: float | None = Field(
+        default=None, ge=0.0, le=1.0,
+        description="最低完成率（0~1）：覆盖完成率低于该值的变体被过滤",
+    )
 
     @model_validator(mode="after")
     def _check_music(self) -> "EnumerateRequest":
         if (self.min_music_score is not None or self.min_music_hits is not None) and self.music is None:
             raise ValueError("设置音乐门槛（min_music_score/min_music_hits）时必须引用评分方案 music")
+        if self.require_full_coverage and self.coverage is None:
+            raise ValueError("要求全覆盖（require_full_coverage）时必须引用覆盖方案 coverage")
+        if self.min_completion is not None and self.coverage is None:
+            raise ValueError("设置最低完成率（min_completion）时必须引用覆盖方案 coverage")
         return self
 
 

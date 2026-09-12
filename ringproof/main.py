@@ -19,6 +19,7 @@ from fastapi.responses import JSONResponse
 from . import __version__
 from .compose import ComposeError, compile_composition, plain_course_length
 from .continuation import search_continuations
+from .coverage import analyze_coverage, coverage_summary
 from .engine import (
     ExpandedLead,
     TouchError,
@@ -41,6 +42,7 @@ from .schemas import (
     CompileRequest,
     CompositionCreate,
     ContinueRequest,
+    CoverageSchemeCreate,
     EnumerateRequest,
     MethodCreate,
     MethodRef,
@@ -181,6 +183,110 @@ def create_app(db_path: str | None = None) -> FastAPI:
         if not rec:
             return JSONResponse(status_code=404, content={"detail": f"评分方案版本不存在: {scheme_id} v{version}"})
         return _music_detail(rec)
+
+    # ---------- all-the-work 覆盖方案 ----------
+    @app.post("/coverage-schemes", status_code=201)
+    def create_coverage_scheme(body: CoverageSchemeCreate):
+        """创建 all-the-work 覆盖方案的不可变版本；同一 id 重复提交递增版本号。
+
+        方法版本在此冻结（留空则取最新）；所有方法须与方案同钟数。
+        重复格、越界钟号或方法钟数不一致在此被拒绝（不落库）。"""
+        stage = body.stage
+        # 解析方法版本：显式版本须存在，留空冻结为最新；同 id 已在模型层拒绝
+        methods: list[dict] = []
+        for ref in body.methods:
+            mv = ref.version or storage.latest_method_version(ref.id)
+            method = storage.get_method(ref.id, mv) if mv else None
+            if not method:
+                detail = (
+                    f"方法不存在: {ref.id}"
+                    if ref.version is None
+                    else f"方法版本不存在: {ref.id} v{ref.version}"
+                )
+                return JSONResponse(status_code=404, content={"detail": detail})
+            if method["stage"] != stage:
+                return JSONResponse(
+                    status_code=422,
+                    content={"detail": {"code": "COVERAGE_STAGE_MISMATCH",
+                                        "message": f"方法 {ref.id!r} 为 {method['stage']} 口钟，"
+                                                   f"与覆盖方案的 {stage} 口不一致"}},
+                )
+            methods.append(method)
+
+        # 展开 place-bell 类别（None → 1..stage），展开后重复格拒绝保存
+        cells: list[dict] = []
+        seen_cells: set[tuple[int, str, int]] = set()
+        for c in body.cells:
+            mrec = next(m for m in methods if m["id"] == c.method)
+            place_bells = list(range(1, stage + 1)) if c.place_bell is None else [c.place_bell]
+            for pb in place_bells:
+                key = (c.bell, c.method, pb)
+                if key in seen_cells:
+                    return JSONResponse(
+                        status_code=422,
+                        content={"detail": {"code": "DUPLICATE_CELL",
+                                            "message": f"覆盖格重复：钟 {c.bell} × 方法 {c.method!r}"
+                                                       f" × place-bell {pb}"}},
+                    )
+                seen_cells.add(key)
+                cells.append({
+                    "bell": c.bell,
+                    "method": c.method,
+                    "method_version": mrec["version"],
+                    "place_bell": pb,
+                    "min_leads": c.min_leads,
+                })
+
+        scheme_id = body.id or _new_id()
+        version = storage.next_coverage_version(scheme_id)
+        spec = {
+            "name": body.name,
+            "stage": stage,
+            "working_bells": sorted(body.working_bells),
+            "methods": [
+                {"id": m["id"], "version": m["version"], "name": m["name"]}
+                for m in methods
+            ],
+            "cells": cells,
+        }
+        rec = {
+            "id": scheme_id,
+            "version": version,
+            "name": body.name,
+            "stage": stage,
+            "spec_json": json.dumps(spec, ensure_ascii=False, sort_keys=True),
+            "input_hash": canonical_hash({
+                **spec,
+                "methods": [
+                    {"id": m["id"], "version": m["version"], "hash": m["input_hash"]}
+                    for m in methods
+                ],
+            }),
+            "created_at": utcnow(),
+        }
+        try:
+            storage.insert_coverage_scheme(rec)
+        except sqlite3.IntegrityError:
+            return JSONResponse(status_code=409, content={"detail": "该 (id, version) 已存在，版本不可变"})
+        return _coverage_detail(rec)
+
+    @app.get("/coverage-schemes")
+    def list_coverage_schemes():
+        return {"coverage_schemes": storage.list_coverage_schemes()}
+
+    @app.get("/coverage-schemes/{scheme_id}")
+    def list_coverage_scheme_versions(scheme_id: str):
+        versions = [m for m in storage.list_coverage_schemes() if m["id"] == scheme_id]
+        if not versions:
+            return JSONResponse(status_code=404, content={"detail": f"覆盖方案不存在: {scheme_id}"})
+        return {"id": scheme_id, "versions": versions}
+
+    @app.get("/coverage-schemes/{scheme_id}/versions/{version}")
+    def get_coverage_scheme(scheme_id: str, version: int):
+        rec = storage.get_coverage_scheme(scheme_id, version)
+        if not rec:
+            return JSONResponse(status_code=404, content={"detail": f"覆盖方案版本不存在: {scheme_id} v{version}"})
+        return _coverage_detail(rec)
 
     # ---------- touch ----------
     @app.post("/touches", status_code=201)
@@ -329,7 +435,19 @@ def create_app(db_path: str | None = None) -> FastAPI:
             if err is not None:
                 return err
             music_id, music_version = scheme["id"], scheme["version"]
-        cached = storage.get_proof(touch_id, version, music_id, music_version)
+        coverage_rec = None
+        coverage_spec = None
+        coverage_id, coverage_version = "", 0
+        if body and body.coverage:
+            coverage_rec, coverage_spec, err = _resolve_coverage(
+                touch_id, version, rec["stage"], body.coverage
+            )
+            if err is not None:
+                return err
+            coverage_id, coverage_version = coverage_rec["id"], coverage_rec["version"]
+        cached = storage.get_proof(
+            touch_id, version, music_id, music_version, coverage_id, coverage_version
+        )
         if cached and cached["input_hash"] == rec["input_hash"]:
             return JSONResponse(
                 json.loads(cached["result_json"]), headers={"X-Proof-Cache": "hit"}
@@ -356,12 +474,31 @@ def create_app(db_path: str | None = None) -> FastAPI:
         }
         if scheme:
             payload["music"] = _music_payload(scheme, result)
+        if coverage_rec:
+            analysis = analyze_coverage(coverage_spec, result)
+            # 未计入方案的方法补名称（覆盖模块只接收证明结果，名称在此解析）
+            name_by_version = {
+                (m["id"], m["version"]): m["name"] for m in ctx["methods"]
+            }
+            for u in analysis["unmatched_methods"]:
+                u["method"]["name"] = name_by_version.get(
+                    (u["method"]["id"], u["method"]["version"])
+                )
+            analysis["scheme"] = {
+                "id": coverage_rec["id"],
+                "version": coverage_rec["version"],
+                "name": coverage_rec["name"],
+                "input_hash": coverage_rec["input_hash"],
+            }
+            payload["coverage"] = analysis
         storage.insert_proof(
             {
                 "touch_id": touch_id,
                 "touch_version": version,
                 "music_id": music_id,
                 "music_version": music_version,
+                "coverage_id": coverage_id,
+                "coverage_version": coverage_version,
                 "input_hash": rec["input_hash"],
                 "result_json": json.dumps(payload, ensure_ascii=False),
                 "created_at": utcnow(),
@@ -376,7 +513,8 @@ def create_app(db_path: str | None = None) -> FastAPI:
         改动数 → 总 change 数 → rounds 回归排序）。超出搜索预算时截断并说明。
         引用评分方案时，在既有约束筛选后按音乐门槛过滤（计数
         filtered_by_music），并按 真值 → rounds 回归 → 音乐分 → 既有排序项
-        稳定排序。"""
+        稳定排序。引用 all-the-work 覆盖方案时，按全覆盖/最低完成率过滤
+        （计数 filtered_by_coverage），并优先按完成率、覆盖均衡度稳定排序。"""
         rec = storage.get_touch(touch_id, version)
         if not rec:
             return JSONResponse(status_code=404, content={"detail": f"touch 版本不存在: {touch_id} v{version}"})
@@ -391,6 +529,14 @@ def create_app(db_path: str | None = None) -> FastAPI:
             spec = json.loads(scheme["spec_json"])
             music_rules = spec["rules"]
             music_flags = (spec["score_start_row"], spec["score_final_rounds"])
+        coverage_rec = None
+        coverage_spec = None
+        if body.coverage:
+            coverage_rec, coverage_spec, err = _resolve_coverage(
+                touch_id, version, rec["stage"], body.coverage
+            )
+            if err is not None:
+                return err
         max_calls = body.max_calls if body.max_calls is not None else ctx["max_calls"]
         flat = ctx["flat_leads"]
 
@@ -428,6 +574,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
         variants = []
         filtered = 0
         filtered_music = 0
+        filtered_coverage = 0
         pruned_quota = 0
         pruned_transition = 0
         checked = 0
@@ -529,9 +676,45 @@ def create_app(db_path: str | None = None) -> FastAPI:
                 ):
                     filtered_music += 1
                     continue
+            if coverage_rec is not None:
+                # all-the-work 覆盖：既有约束筛选之后，按全覆盖/完成率门槛过滤
+                ca = analyze_coverage(coverage_spec, r)
+                summary = coverage_summary(ca)
+                variant["coverage"] = summary
+                if (body.require_full_coverage and not summary["full_coverage"]) or (
+                    body.min_completion is not None
+                    and summary["completion"] < body.min_completion
+                ):
+                    filtered_coverage += 1
+                    continue
             variants.append(variant)
 
-        if scheme is not None:
+        if coverage_rec is not None:
+            # 覆盖完成率（高者优先）→ 覆盖均衡度（各钟完成率极差小者优先）
+            # → 真值 → rounds 回归 → （音乐分）→ 既有排序项，稳定排序
+            coverage_head = [lambda v: -v["coverage"]["completion"],
+                             lambda v: v["coverage"]["balance"]]
+            coverage_by = ["coverage_completion", "coverage_balance"]
+            if scheme is not None:
+                music_head = [lambda v: -v["music_score"]]
+                music_by = ["music_score"]
+            else:
+                music_head, music_by = [], []
+            if ctx["multi"]:
+                tail = [lambda v: v["truth"] != "true", lambda v: not v["rounds_return"],
+                        lambda v: v["num_splices"], lambda v: v["balance"],
+                        lambda v: v["num_calls"], lambda v: v["total_changes"],
+                        lambda v: v["methods"], lambda v: v["calls"]]
+                tail_by = ["truth", "rounds_return", "num_splices", "balance",
+                           "num_calls", "total_changes"]
+            else:
+                tail = [lambda v: v["truth"] != "true", lambda v: not v["rounds_return"],
+                        lambda v: v["num_calls"], lambda v: v["total_changes"]]
+                tail_by = ["truth", "rounds_return", "num_calls", "total_changes"]
+            parts = coverage_head + music_head + tail
+            variants.sort(key=lambda v: tuple(p(v) for p in parts))
+            sorted_by = coverage_by + music_by + tail_by
+        elif scheme is not None:
             # 真值 → rounds 回归 → 音乐分（高者优先）→ 既有排序项，稳定排序
             if ctx["multi"]:
                 variants.sort(
@@ -613,6 +796,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
             "pruned_by_transition": pruned_transition,
             "filtered_by_max_calls": filtered,
             "filtered_by_music": filtered_music,
+            "filtered_by_coverage": filtered_coverage,
             "total_variants": len(variants),
             "variants": variants,
         }
@@ -625,6 +809,15 @@ def create_app(db_path: str | None = None) -> FastAPI:
             }
             response["min_music_score"] = body.min_music_score
             response["min_music_hits"] = body.min_music_hits
+        if coverage_rec is not None:
+            response["coverage"] = {
+                "id": coverage_rec["id"],
+                "version": coverage_rec["version"],
+                "name": coverage_rec["name"],
+                "input_hash": coverage_rec["input_hash"],
+            }
+            response["require_full_coverage"] = body.require_full_coverage
+            response["min_completion"] = body.min_completion
         return response
 
     # ---------- 呼叫位置方案 ----------
@@ -1660,6 +1853,66 @@ def create_app(db_path: str | None = None) -> FastAPI:
             "input_hash": rec["input_hash"],
             "created_at": rec["created_at"],
         }
+
+    def _coverage_detail(rec: dict) -> dict:
+        spec = json.loads(rec["spec_json"])
+        return {
+            "id": rec["id"],
+            "version": rec["version"],
+            "name": rec["name"],
+            "stage": rec["stage"],
+            "working_bells": spec["working_bells"],
+            "methods": spec["methods"],
+            "cells": spec["cells"],
+            "input_hash": rec["input_hash"],
+            "created_at": rec["created_at"],
+        }
+
+    def _resolve_coverage(touch_id: str, touch_version: int, stage: int, ref):
+        """解析覆盖方案版本：显式版本直接使用；留空时随 touch 版本冻结
+        （首次引用时定格为最新版本，之后同一 touch 版本复用同一方案版本）。
+        返回 (scheme, spec, None) 或 (None, None, 错误响应)。"""
+        if ref.version is not None:
+            scheme = storage.get_coverage_scheme(ref.id, ref.version)
+            if not scheme:
+                return None, None, JSONResponse(
+                    status_code=404,
+                    content={"detail": f"覆盖方案版本不存在: {ref.id} v{ref.version}"},
+                )
+        else:
+            frozen = storage.get_touch_coverage(touch_id, touch_version, ref.id)
+            cv = (
+                frozen["coverage_version"]
+                if frozen
+                else storage.latest_coverage_version(ref.id)
+            )
+            if cv is None:
+                return None, None, JSONResponse(
+                    status_code=404, content={"detail": f"覆盖方案不存在: {ref.id}"}
+                )
+            scheme = storage.get_coverage_scheme(ref.id, cv)
+            if not frozen:
+                storage.insert_touch_coverage(
+                    {
+                        "touch_id": touch_id,
+                        "touch_version": touch_version,
+                        "coverage_id": ref.id,
+                        "coverage_version": cv,
+                        "created_at": utcnow(),
+                    }
+                )
+        if scheme["stage"] != stage:
+            return None, None, JSONResponse(
+                status_code=422,
+                content={
+                    "detail": {
+                        "code": "COVERAGE_STAGE_MISMATCH",
+                        "message": f"覆盖方案 {ref.id!r} 为 {scheme['stage']} 口钟，"
+                        f"与 touch 的 {stage} 口不符",
+                    }
+                },
+            )
+        return scheme, json.loads(scheme["spec_json"]), None
 
     def _resolve_music(touch_id: str, touch_version: int, stage: int, ref):
         """解析评分方案版本：显式版本直接使用；留空时随 touch 版本冻结

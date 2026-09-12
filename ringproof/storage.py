@@ -1,11 +1,12 @@
-"""SQLite 不可变版本存储：方法、touch、音乐评分方案、呼叫位置方案、
-composition 与编译（compilation）结果。
+"""SQLite 不可变版本存储：方法、touch、音乐评分方案、all-the-work 覆盖方案、
+呼叫位置方案、composition 与编译（compilation）结果。
 
-方法、touch、评分方案、位置方案与 composition 以 (id, version) 为主键只增
-不改；证明结果以 (touch_id, touch_version, music_id, music_version) 为主键
-缓存，编译结果以 (composition_id, composition_version, request_hash) 为主键
-缓存，保证同一版本重复证明/编译结果一致。touch_music 记录 touch 版本首次
-引用某评分方案时冻结的版本。
+方法、touch、评分方案、覆盖方案、位置方案与 composition 以 (id, version) 为
+主键只增不改；证明结果以 (touch_id, touch_version, music_id, music_version,
+coverage_id, coverage_version) 为主键缓存，编译结果以 (composition_id,
+composition_version, request_hash) 为主键缓存，保证同一版本重复证明/编译结果
+一致。touch_music / touch_coverage 分别记录 touch 版本首次引用某评分/覆盖
+方案时冻结的版本。
 """
 from __future__ import annotations
 
@@ -45,10 +46,12 @@ CREATE TABLE IF NOT EXISTS proofs (
     touch_version INTEGER NOT NULL,
     music_id TEXT NOT NULL,
     music_version INTEGER NOT NULL,
+    coverage_id TEXT NOT NULL DEFAULT '',
+    coverage_version INTEGER NOT NULL DEFAULT 0,
     input_hash TEXT NOT NULL,
     result_json TEXT NOT NULL,
     created_at TEXT NOT NULL,
-    PRIMARY KEY (touch_id, touch_version, music_id, music_version)
+    PRIMARY KEY (touch_id, touch_version, music_id, music_version, coverage_id, coverage_version)
 );
 CREATE TABLE IF NOT EXISTS music_schemes (
     id TEXT NOT NULL,
@@ -67,6 +70,24 @@ CREATE TABLE IF NOT EXISTS touch_music (
     music_version INTEGER NOT NULL,
     created_at TEXT NOT NULL,
     PRIMARY KEY (touch_id, touch_version, music_id)
+);
+CREATE TABLE IF NOT EXISTS coverage_schemes (
+    id TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    stage INTEGER NOT NULL,
+    spec_json TEXT NOT NULL,
+    input_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (id, version)
+);
+CREATE TABLE IF NOT EXISTS touch_coverage (
+    touch_id TEXT NOT NULL,
+    touch_version INTEGER NOT NULL,
+    coverage_id TEXT NOT NULL,
+    coverage_version INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (touch_id, touch_version, coverage_id)
 );
 CREATE TABLE IF NOT EXISTS prefixes (
     id TEXT NOT NULL,
@@ -158,11 +179,11 @@ class Storage:
         self._conn.row_factory = sqlite3.Row
         self._lock = threading.Lock()
         with self._lock:
-            # proofs 为可再生的缓存表：旧库缺少音乐维度列时直接重建
+            # proofs 为可再生的缓存表：旧库缺少音乐/覆盖维度列时直接重建
             cols = [
                 r[1] for r in self._conn.execute("PRAGMA table_info(proofs)").fetchall()
             ]
-            if cols and "music_id" not in cols:
+            if cols and ("music_id" not in cols or "coverage_id" not in cols):
                 self._conn.execute("DROP TABLE proofs")
             self._conn.executescript(SCHEMA)
 
@@ -268,12 +289,15 @@ class Storage:
         touch_version: int,
         music_id: str = "",
         music_version: int = 0,
+        coverage_id: str = "",
+        coverage_version: int = 0,
     ) -> dict | None:
         with self._lock:
             row = self._conn.execute(
                 "SELECT * FROM proofs WHERE touch_id = ? AND touch_version = ?"
-                " AND music_id = ? AND music_version = ?",
-                (touch_id, touch_version, music_id, music_version),
+                " AND music_id = ? AND music_version = ?"
+                " AND coverage_id = ? AND coverage_version = ?",
+                (touch_id, touch_version, music_id, music_version, coverage_id, coverage_version),
             ).fetchone()
         return dict(row) if row else None
 
@@ -282,13 +306,15 @@ class Storage:
             self._conn.execute(
                 "INSERT OR IGNORE INTO proofs"
                 " (touch_id, touch_version, music_id, music_version,"
-                " input_hash, result_json, created_at)"
-                " VALUES (?,?,?,?,?,?,?)",
+                " coverage_id, coverage_version, input_hash, result_json, created_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?)",
                 (
                     rec["touch_id"],
                     rec["touch_version"],
                     rec.get("music_id", ""),
                     rec.get("music_version", 0),
+                    rec.get("coverage_id", ""),
+                    rec.get("coverage_version", 0),
                     rec["input_hash"],
                     rec["result_json"],
                     rec["created_at"],
@@ -368,6 +394,84 @@ class Storage:
                     rec["touch_version"],
                     rec["music_id"],
                     rec["music_version"],
+                    rec["created_at"],
+                ),
+            )
+            self._conn.commit()
+
+    # ---------------- all-the-work 覆盖方案 ----------------
+    def next_coverage_version(self, scheme_id: str) -> int:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT MAX(version) AS v FROM coverage_schemes WHERE id = ?",
+                (scheme_id,),
+            ).fetchone()
+        return (row["v"] or 0) + 1
+
+    def insert_coverage_scheme(self, rec: dict) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO coverage_schemes"
+                " (id, version, name, stage, spec_json, input_hash, created_at)"
+                " VALUES (?,?,?,?,?,?,?)",
+                (
+                    rec["id"],
+                    rec["version"],
+                    rec["name"],
+                    rec["stage"],
+                    rec["spec_json"],
+                    rec["input_hash"],
+                    rec["created_at"],
+                ),
+            )
+            self._conn.commit()
+
+    def get_coverage_scheme(self, scheme_id: str, version: int) -> dict | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM coverage_schemes WHERE id = ? AND version = ?",
+                (scheme_id, version),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def latest_coverage_version(self, scheme_id: str) -> int | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT MAX(version) AS v FROM coverage_schemes WHERE id = ?",
+                (scheme_id,),
+            ).fetchone()
+        return row["v"]
+
+    def list_coverage_schemes(self) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, version, name, stage, input_hash, created_at"
+                " FROM coverage_schemes ORDER BY id, version"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_touch_coverage(
+        self, touch_id: str, touch_version: int, coverage_id: str
+    ) -> dict | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM touch_coverage"
+                " WHERE touch_id = ? AND touch_version = ? AND coverage_id = ?",
+                (touch_id, touch_version, coverage_id),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def insert_touch_coverage(self, rec: dict) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO touch_coverage"
+                " (touch_id, touch_version, coverage_id, coverage_version, created_at)"
+                " VALUES (?,?,?,?,?)",
+                (
+                    rec["touch_id"],
+                    rec["touch_version"],
+                    rec["coverage_id"],
+                    rec["coverage_version"],
                     rec["created_at"],
                 ),
             )
