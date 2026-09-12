@@ -4,7 +4,7 @@
 import pytest
 from fastapi.testclient import TestClient
 
-from ringproof.blocks import BlockError, make_block, perm_inverse, search_blocks
+from ringproof.blocks import BlockError, apply_pos_perm, make_block, search_blocks
 from ringproof.engine import apply_change, build_lead, prove_rows
 from ringproof.main import create_app
 from ringproof.multipart import permute_row
@@ -62,10 +62,12 @@ def test_make_block_relative_permutation_and_reexpansion():
     assert b["length"] == 12 and b["calls"] == 0
     assert b["methods"] == ["pb"]
     assert b["start_lead"] == 1 and b["end_lead"] == 1
-    # 相对起点的钟置换：从不同 lead head 展开，末 row 为起点的 φ 像
+    # 相对起点的钟置换：末 row 为起点的 φ 像
     assert permute_row(b["images"], ROUNDS6) == (1, 3, 5, 2, 6, 4)
-    assert permute_row(b["images"], (1, 3, 5, 2, 6, 4)) == (1, 5, 6, 3, 4, 2)
-    # 逐 change 展开与置换一致
+    # 净位置置换：从不同 lead head 展开，末 row 第 i 位为 lead head 第 C[i] 位的钟
+    assert apply_pos_perm(b["pos_perm"], ROUNDS6) == (1, 3, 5, 2, 6, 4)
+    assert apply_pos_perm(b["pos_perm"], (1, 3, 5, 2, 6, 4)) == (1, 5, 6, 3, 4, 2)
+    # 逐 change 展开与位置置换一致
     cur = (1, 3, 5, 2, 6, 4)
     for places, _prov in b["changes"]:
         cur = apply_change(cur, places)
@@ -74,8 +76,8 @@ def test_make_block_relative_permutation_and_reexpansion():
     prov = b["changes"][11][1]
     assert prov["touch_change"] == 12 and prov["lead"] == 1
     assert prov["method_id"] == "pb" and prov["call"] is None
-    # 逆置换
-    assert permute_row(perm_inverse(b["images"]), (1, 3, 5, 2, 6, 4)) == ROUNDS6
+    # 逆位置置换：末 row 可还原起点
+    assert apply_pos_perm(b["inv_pos_perm"], (1, 3, 5, 2, 6, 4)) == ROUNDS6
 
 
 def test_make_block_calls_and_methods():
@@ -114,6 +116,20 @@ def test_make_block_self_false_rejected():
         _make("A", rows, events, lead_ends, 0, 48)
     assert ei.value.code == "BLOCK_NOT_TRUE"
     assert "135264" in ei.value.message
+
+
+def _rows_for(notation, n_leads, stage=4):
+    """任意方法/钟数的逐 row 展开（无 call），供异起点与重复用例。"""
+    toks, chs = expand_notation(notation, stage)
+    start = tuple(range(1, stage + 1))
+    leads = [
+        build_lead(toks, chs, None, {}, method_id="m", method_version=1, method_name="M")
+        for _ in range(n_leads)
+    ]
+    result = prove_rows(stage, "M", leads, start)
+    rows = [start] + [tuple(int(c) for c in ev["row"]) for ev in result["events"]]
+    lead_ends = [len(toks) * (i + 1) for i in range(n_leads)]
+    return rows, result["events"], lead_ends
 
 
 # ---------------- 组合搜索 ----------------
@@ -245,6 +261,73 @@ def test_search_deterministic_repeat():
     s1 = _search([a, b], max_changes=36)
     s2 = _search([a, b], max_changes=36)
     assert s1 == s2
+
+
+def test_search_from_different_lead_head():
+    # 异起点：block 为单个全交叉 change，从 3124 展开应到达 1342
+    rows, events, lead_ends = _rows_for("x", 2)
+    x = make_block(
+        stage=4, block_id="X", touch_id="t", touch_version=1,
+        rows=rows, events=events, lead_end_indices=lead_ends,
+        start_change=0, end_change=1, min_uses=0, max_uses=None,
+    )
+    assert x["pos_perm"] == (1, 0, 3, 2)
+    # 有目标：逐 change 展开可达 1342，可达性剪枝不得误杀
+    s = search_blocks(
+        blocks=[x], start_row=(3, 1, 2, 4), target=(1, 3, 4, 2),
+        min_changes=0, max_changes=1, allowed=None, forbidden=set(),
+        max_results=50, max_search=1000,
+    )
+    assert s["total_results"] == 1
+    r = s["results"][0]
+    assert r["final_row"] == "1342" and r["target_reached"] is True
+    # 分段末行与组合末行一致（统一按净位置置换计算）
+    assert r["segments"][0]["start_row"] == "3124"
+    assert r["segments"][0]["end_row"] == "1342"
+    # 无目标：final_row 与 segments 末行同样一致
+    s2 = search_blocks(
+        blocks=[x], start_row=(3, 1, 2, 4), target=None,
+        min_changes=0, max_changes=1, allowed=None, forbidden=set(),
+        max_results=50, max_search=1000,
+    )
+    r2 = s2["results"][0]
+    assert r2["final_row"] == "1342"
+    assert r2["segments"][0]["end_row"] == r2["final_row"]
+
+
+def test_search_target_cannot_bypass_repeat():
+    # A、B 展开为 1234、2143、2134、2143：2143 已重复，目标末行不豁免
+    rows_a, events_a, le_a = _rows_for("x12", 1)  # 1234 → 2143 → 2134
+    rows_b, events_b, le_b = _rows_for("12", 1)   # 1234 → 1243
+    a = make_block(
+        stage=4, block_id="A", touch_id="t1", touch_version=1,
+        rows=rows_a, events=events_a, lead_end_indices=le_a,
+        start_change=0, end_change=2, min_uses=0, max_uses=None,
+    )
+    b = make_block(
+        stage=4, block_id="B", touch_id="t2", touch_version=1,
+        rows=rows_b, events=events_b, lead_end_indices=le_b,
+        start_change=0, end_change=1, min_uses=0, max_uses=None,
+    )
+    s = search_blocks(
+        blocks=[a, b], start_row=(1, 2, 3, 4), target=(2, 1, 4, 3),
+        min_changes=0, max_changes=3, allowed=None, forbidden=set(),
+        max_results=50, max_search=1000,
+    )
+    # [A, B] 末行 2143 重复出现，须排除；[B, A]（1234、1243、2134、2143）为真
+    assert [r["sequence"] for r in s["results"]] == [["B", "A"]]
+    assert s["pruned_by_rows"] >= 1
+    # 冲突对应两次出现的来源：A 的第 1 个 change 与 B 的第 1 个 change
+    fc = s["first_conflict"]
+    assert fc["row"] == "2143"
+    assert fc["first"]["block"] == "A" and fc["first"]["block_index"] == 1
+    assert fc["first"]["change_in_block"] == 1 and fc["first"]["change"] == 1
+    assert fc["first"]["touch"] == {"id": "t1", "version": 1}
+    assert fc["first"]["touch_change"] == 1 and fc["first"]["call"] is None
+    assert fc["second"]["block"] == "B" and fc["second"]["block_index"] == 2
+    assert fc["second"]["change_in_block"] == 1 and fc["second"]["change"] == 3
+    assert fc["second"]["touch"] == {"id": "t2", "version": 1}
+    assert fc["second"]["touch_change"] == 1 and fc["second"]["call"] is None
 
 
 # ---------------- API ----------------
@@ -545,3 +628,108 @@ def test_api_search_truncation_and_max_results(client, touches):
     body2 = r2.json()
     assert body2["candidates"] == 4 and body2["total_results"] == 2
     assert [x["total_changes"] for x in body2["results"]] == [12, 24]
+
+
+def test_api_search_different_head(client):
+    """异起点回归：单全交叉 block 从 3124 展开应到达 1342，且分段末行一致。"""
+    client.post(
+        "/methods",
+        json={"id": "mx", "name": "Cross", "stage": 4, "notation": "x"},
+    )
+    client.post(
+        "/touches",
+        json={"id": "tx", "method_id": "mx",
+              "sequence": [{"leads": [{"call": None}], "repeat": 2}]},
+    )
+    r = client.post(
+        "/block-compositions",
+        json={
+            "id": "different-head",
+            "blocks": [{"id": "X", "touch": {"id": "tx"}, "start_change": 0, "end_change": 1}],
+            "start_row": "3124",
+            "target_row": "1342",
+            "max_changes": 1,
+        },
+    )
+    assert r.status_code == 201
+    # 有目标：逐 change 展开可达 1342，可达性剪枝不得漏掉合法组合
+    r = client.post("/block-compositions/different-head/versions/1/search", json={})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["total_results"] == 1
+    res = body["results"][0]
+    assert res["sequence"] == ["X"]
+    assert res["final_row"] == "1342" and res["target_reached"] is True
+    assert res["segments"][0]["start_row"] == "3124"
+    assert res["segments"][0]["end_row"] == "1342"
+    # 移除目标限制：final_row 与 segments 末行同样一致
+    assert client.post(
+        "/block-compositions",
+        json={
+            "id": "different-head-open",
+            "blocks": [{"id": "X", "touch": {"id": "tx"}, "start_change": 0, "end_change": 1}],
+            "start_row": "3124",
+            "max_changes": 1,
+        },
+    ).status_code == 201
+    body2 = client.post(
+        "/block-compositions/different-head-open/versions/1/search", json={}
+    ).json()
+    res2 = body2["results"][0]
+    assert res2["final_row"] == "1342"
+    assert res2["segments"][0]["end_row"] == res2["final_row"]
+
+
+def test_api_search_target_cannot_bypass_repeat(client):
+    """目标末行不豁免重复：2143 两次出现的 [A, B] 须排除并给出两侧来源。"""
+    client.post(
+        "/methods",
+        json={"id": "m-x12", "name": "CrossThen12", "stage": 4, "notation": "x12"},
+    )
+    client.post(
+        "/methods",
+        json={"id": "m-12", "name": "Only12", "stage": 4, "notation": "12"},
+    )
+    client.post(
+        "/touches",
+        json={"id": "ta", "method_id": "m-x12",
+              "sequence": [{"leads": [{"call": None}]}]},
+    )
+    client.post(
+        "/touches",
+        json={"id": "tb", "method_id": "m-12",
+              "sequence": [{"leads": [{"call": None}]}]},
+    )
+    # A：1234 → 2143 → 2134；B：再接一个 change 到 2143（重复）
+    r = client.post(
+        "/block-compositions",
+        json={
+            "id": "repeat-target",
+            "blocks": [
+                {"id": "A", "touch": {"id": "ta"}, "start_change": 0, "end_change": 2},
+                {"id": "B", "touch": {"id": "tb"}, "start_change": 0, "end_change": 1},
+            ],
+            "start_row": "1234",
+            "target_row": "2143",
+            "max_changes": 3,
+        },
+    )
+    assert r.status_code == 201
+    body = client.post("/block-compositions/repeat-target/versions/1/search", json={}).json()
+    seqs = [x["sequence"] for x in body["results"]]
+    # [A, B]（1234、2143、2134、2143，2143 重复）须排除；[B, A] 为真保留
+    assert ["A", "B"] not in seqs
+    assert seqs == [["B", "A"]]
+    assert body["pruned_by_rows"] >= 1
+    fc = body["first_conflict"]
+    assert fc["row"] == "2143"
+    assert fc["first"]["block"] == "A" and fc["first"]["block_index"] == 1
+    assert fc["first"]["change_in_block"] == 1 and fc["first"]["change"] == 1
+    assert fc["first"]["touch"] == {"id": "ta", "version": 1}
+    assert fc["first"]["touch_change"] == 1
+    assert fc["first"]["method"] == "CrossThen12" and fc["first"]["call"] is None
+    assert fc["second"]["block"] == "B" and fc["second"]["block_index"] == 2
+    assert fc["second"]["change_in_block"] == 1 and fc["second"]["change"] == 3
+    assert fc["second"]["touch"] == {"id": "tb", "version": 1}
+    assert fc["second"]["touch_change"] == 1
+    assert fc["second"]["method"] == "Only12" and fc["second"]["call"] is None

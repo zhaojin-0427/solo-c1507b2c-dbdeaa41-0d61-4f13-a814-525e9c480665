@@ -42,7 +42,7 @@ lead end 的连续区段作为一个 part，设置预期 part 数与必须保持
 
 支持**可复用 block 拼装**：调用方从多个不可变 touch 截取首尾落在
 lead end 的区段作为 block，设置各 block 使用次数与相邻衔接规则，并限定
-总 change 数与目标末行；区段保存时转为相对起点的钟置换，可从不同
+总 change 数与目标末行；区段保存时转为相对起点的位置置换，可从不同
 lead head 展开，钟数不一致、边界非法或区段自身为假时拒绝保存。搜索按
 展开后的逐 row 检查跨 block 重复，只返回满足用量、衔接、长度与末行要求
 的组合，冲突列出相同 row 两侧的 block、touch、change、method、call 来源；
@@ -517,10 +517,11 @@ curl -X POST localhost:8765/multipart-analyses/mp/versions/1/enumerate \
 ## 可复用 block 拼装
 
 把多个 touch 的 lead-end 区段当作可复用积木：每个 block 保存时转为
-**相对起点的钟置换** φ（change 作用于位置、φ 作用于钟，两者可交换），
-因此同一 block 可从任意 lead head 展开——从任意 row 出发施加同一串
-change，末 row 恰为该 row 的 φ 像。组合搜索把 block 逐个衔接，检查跨
-block 重复，找出满足全部约束的拼装方案。
+**相对起点的位置置换** C（末 row 第 i 位的钟来自区段起点第 C[i] 位；
+change 作用于位置、与起点无关），因此同一 block 可从任意 lead head
+展开——从任意 row 出发施加同一串 change，末 row 由同一位置置换唯一
+确定（规范化摘要同时给出相对起点的钟置换 φ）。组合搜索把 block 逐个
+衔接，检查跨 block 重复，找出满足全部约束的拼装方案。
 
 ### 1. 创建 block composition（不可变版本，冻结 touch/方法/call 依赖）
 
@@ -563,8 +564,10 @@ curl -X POST localhost:8765/block-compositions/bc/versions/1/search \
 ```
 
 深度优先枚举（block 按声明顺序分支），按展开后的逐 row 检查**跨 block
-重复**（组合末 row 等于目标属正常达成，不算重复；到达目标即终止该
-路径），只返回满足用量、衔接、长度与末行要求的组合：
+重复**（到达目标即终止该路径；仅当目标即起点时，组合末 row 回到起点
+属正常闭合 come-round，不算重复——其余任何重复，含目标末行撞上路径中
+已出现的 row，一律按冲突剪枝），只返回满足用量、衔接、长度与末行要求
+的组合：
 
 - 剪枝：**端点可达性**（当前 row 到目标的最少 block 数，自目标反向 BFS
   的安全下界）→ **剩余长度**（补足最少用量所需与可达 change 范围）→

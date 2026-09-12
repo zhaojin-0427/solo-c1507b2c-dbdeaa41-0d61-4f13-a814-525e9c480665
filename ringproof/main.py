@@ -5,7 +5,7 @@
 证明与枚举可引用不可变的音乐评分方案（精确 row / 前后端连续钟组 /
 指定钟位置三类规则），返回总分、各规则命中数与首次/最高分 row 来源。
 可复用 block 拼装：从多个不可变 touch 截取 lead-end 区段作为 block
-（转为相对起点的钟置换，可从不同 lead head 展开），设置使用次数与相邻
+（转为相对起点的位置置换，可从不同 lead head 展开），设置使用次数与相邻
 衔接规则、限定总 change 数与目标末行，搜索满足约束且无跨 block 重复的
 组合。
 """
@@ -1743,7 +1743,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
     @app.post("/block-compositions", status_code=201)
     def create_block_composition(body: BlockCompositionCreate):
         """创建 block 拼装的不可变版本：从多个不可变 touch 截取首尾落在
-        lead end 的区段作为可复用 block（转为相对起点的钟置换，可从不同
+        lead end 的区段作为可复用 block（转为相对起点的位置置换，可从不同
         lead head 展开），设置使用次数与相邻衔接规则，限定总 change 数与
         目标末行。钟数不一致、边界非法或区段自身为假时拒绝保存（不落库）。
         touch 版本在此冻结（留空则取最新）。"""

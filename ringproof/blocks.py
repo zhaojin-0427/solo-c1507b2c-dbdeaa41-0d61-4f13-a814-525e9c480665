@@ -3,9 +3,10 @@
 调用方从多个不可变 touch 截取首尾落在 lead end 的连续区段作为 block，
 为每个 block 设置使用次数（min/max），并配置相邻衔接规则（允许/禁止的
 block 转换）、总 change 数范围与目标末行。区段在保存时转为**相对起点的
-钟置换** φ——φ(钟) = 在区段末 row 中接替该钟位置的钟；change 作用于位置、
-φ 作用于钟，两者可交换，因此同一 block 可从任意 lead head 展开：从任意
-row R 出发施加同一串 change，末 row 恰为 R 的 φ 像。
+位置置换** C（末 row 第 i 位的钟来自区段起点第 C[i] 位）；change 作用于
+位置、与起点无关，因此同一 block 可从任意 lead head 展开：从任意 row R
+出发逐 change 施加，末 row 第 i 位即 R 第 C[i] 位的钟。规范化摘要同时
+给出相对起点的钟置换 φ（φ(起点第 i 位的钟) = 末 row 第 i 位的钟）。
 
 创建时的拒绝条件（不落库）：
 
@@ -17,12 +18,13 @@ row R 出发施加同一串 change，末 row 恰为 R 的 φ 像。
 
 搜索（深度优先，block 按声明顺序分支）按展开后的逐 row 检查跨 block
 重复，只返回满足用量、衔接、长度与末行要求的组合；先按**端点可达性**
-（当前 row 到目标的最少 block 数，自目标反向 BFS 的安全下界）、**剩余
-长度**（补足最少用量所需与可达 change 范围）与**行交集**剪枝，再按
+（当前 row 到目标的最少 block 数，按位置置换自目标反向 BFS 的安全下界）、
+**剩余长度**（补足最少用量所需与可达 change 范围）与**行交集**剪枝，再按
 目标达成 → 总 change 数 → block 数 → call 数（→ 确定性字典序）稳定
 排序。行交集冲突记录首次冲突的两侧来源（block、touch、change、method、
-call）。到达目标即终止该路径；组合末 row 等于目标属正常达成，不算重复。
-搜索对同一输入完全确定。
+call）。到达目标即终止该路径；仅当目标即起点时，组合末 row 回到起点属
+正常闭合（come-round），不算重复——其余任何重复（含目标末行撞上路径中
+已出现的 row）一律按冲突剪枝。搜索对同一输入完全确定。
 """
 from __future__ import annotations
 
@@ -31,7 +33,6 @@ from .multipart import (
     bell_permutation,
     perm_cycles,
     perm_order,
-    permute_row,
     segment_leads,
 )
 from .notation import row_to_string
@@ -50,12 +51,17 @@ class BlockError(ValueError):
         self.message = message
 
 
-def perm_inverse(images: tuple[int, ...]) -> tuple[int, ...]:
-    """钟置换的逆：``inv[images[b - 1] - 1] == b``。"""
-    inv = [0] * len(images)
-    for b in range(1, len(images) + 1):
-        inv[images[b - 1] - 1] = b
+def _inverse_perm(perm: tuple[int, ...]) -> tuple[int, ...]:
+    """0 起位置置换的逆：``inv[perm[i]] == i``。"""
+    inv = [0] * len(perm)
+    for i, p in enumerate(perm):
+        inv[p] = i
     return tuple(inv)
+
+
+def apply_pos_perm(perm: tuple[int, ...], row: tuple[int, ...]) -> tuple[int, ...]:
+    """对 row 施加位置置换：``end[i] = row[perm[i]]``。"""
+    return tuple(row[p] for p in perm)
 
 
 # ---------------- block 构建 ----------------
@@ -141,6 +147,14 @@ def make_block(
             call_leads.add(ev["lead"])
         methods.add(ev["method_id"] if ev["method_id"] is not None else ev["method"])
 
+    # 区段的净位置置换 C（end[i] = start[C[i]]）：对恒等 row 施加同一串
+    # change 即得。block 从任意 lead head R 展开时，末 row 第 i 位为 R 第
+    # C[i] 位的钟——展开、可达性剪枝与分段末行统一按 C 计算。
+    cur = tuple(range(1, stage + 1))
+    for places, _prov in changes:
+        cur = apply_change(cur, places)
+    pos_perm = tuple(b - 1 for b in cur)
+
     images = bell_permutation(seg_rows[0], seg_rows[-1])
     start_lead, end_lead = segment_leads(lead_end_indices, start_change, end_change)
     return {
@@ -152,6 +166,8 @@ def make_block(
         "start_row": seg_rows[0],
         "end_row": seg_rows[-1],
         "images": images,
+        "pos_perm": pos_perm,
+        "inv_pos_perm": _inverse_perm(pos_perm),
         "calls": len(call_leads),
         "methods": sorted(methods),
         "start_lead": start_lead,
@@ -194,12 +210,12 @@ def block_summary(block: dict) -> dict:
 def _reachability(
     blocks: list[dict], target: tuple[int, ...], max_depth: int
 ) -> dict | None:
-    """各 row 到 target 的最少 block 数（自目标反向 BFS）。
+    """各 row 到 target 的最少 block 数（按净位置置换自目标反向 BFS）。
 
     忽略用量/衔接/禁重，是安全下界：剩余 block 预算小于该步数时必然无法
     到达目标。行表超出预算时返回 None（停用可达性剪枝，不影响正确性）。
     """
-    inverses = [perm_inverse(b["images"]) for b in blocks]
+    inverses = [b["inv_pos_perm"] for b in blocks]
     dist = {target: 0}
     frontier = [target]
     depth = 0
@@ -208,7 +224,7 @@ def _reachability(
         nxt: list[tuple[int, ...]] = []
         for r in frontier:
             for inv in inverses:
-                src = permute_row(inv, r)
+                src = apply_pos_perm(inv, r)
                 if src not in dist:
                     dist[src] = depth
                     nxt.append(src)
@@ -387,15 +403,19 @@ def search_blocks(
             if changes + b["length"] > max_changes:
                 pruned_by_length += 1
                 continue
-            # 行交集：展开 block 的逐 row，与当前路径已用 row 比对
-            # （block 末 row 等于目标属正常达成，豁免）
+            # 行交集：展开 block 的逐 row，与当前路径已用 row 比对。
+            # 仅"回到起点"（目标即起点）的 block 末 row 豁免；其余重复——
+            # 含目标末行撞上路径中已出现的 row——一律按冲突剪枝。
             cur = row
             added: list[tuple[tuple[int, ...], int]] = []
             conflict: tuple[tuple[int, ...], int] | None = None
             for j in range(1, b["length"] + 1):
                 cur = apply_change(cur, b["changes"][j - 1][0])
                 if cur in used and not (
-                    j == b["length"] and target is not None and cur == target
+                    j == b["length"]
+                    and target is not None
+                    and cur == target
+                    and cur == start_row
                 ):
                     conflict = (cur, j)
                     break
@@ -434,7 +454,7 @@ def search_blocks(
         cur = start_row
         for seq, i in enumerate(spec["path"], 1):
             b = blocks[i]
-            end = permute_row(b["images"], cur)
+            end = apply_pos_perm(b["pos_perm"], cur)
             segments.append(
                 {
                     "seq": seq,
