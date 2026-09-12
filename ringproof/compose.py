@@ -223,6 +223,7 @@ def compile_composition(
     for part_idx, part in enumerate(parts, 1):
         part_name = part.get("name")
         part_lead = 0  # 本 part 已经敲的 lead 数（仅用于候选序号展示）
+        last_token_info: dict | None = None  # 本 part 最后一个已解析 token（收尾失败时定位用）
 
         def _append_lead(call: str | None, symbol: str | None, token_no: int | None):
             nonlocal cur, global_lead, part_lead
@@ -278,6 +279,7 @@ def compile_composition(
                 "max_plain_leads": max_before,
                 "target_position": target,
             }
+            last_token_info = token_info
             candidate_payload = [_candidate(e, part_lead) for e in candidates]
 
             if not matched:
@@ -343,6 +345,7 @@ def compile_composition(
                 f"（{scheme['home_symbol']}，第 {home_position} 位）",
                 {
                     "part": part_idx,
+                    "token": last_token_info,
                     "candidate_leads": [
                         {
                             "lead_index": part_lead + i + 1,

@@ -986,20 +986,31 @@ def create_app(db_path: str | None = None) -> FastAPI:
                     "tokens": [t.model_dump() for t in part.tokens],
                 })
 
+        touch_id = body.touch_id or f"compiled:{composition_id}"
         request_key = {
             "course_head": row_to_string(start_row),
             "course_length": body.course_length,
             "expect_rounds": body.expect_rounds,
             "save_touch": body.save_touch,
+            # touch_id 决定另存 touch 的身份，必须纳入缓存键，否则改成新 id
+            # 会命中旧 id 的缓存（返回旧 touch、新 touch 从未落库）
+            "touch_id": touch_id if body.save_touch else None,
             "composition_hash": rec["input_hash"],
             "ringproof_version": __version__,
         }
         request_hash = canonical_hash(request_key)
         cached = storage.get_compilation(composition_id, version, request_hash)
         if cached and cached["input_hash"] == rec["input_hash"]:
-            return JSONResponse(
-                json.loads(cached["result_json"]), headers={"X-Compile-Cache": "hit"}
+            # 缓存命中仍须确认其指向的 touch 版本存在（可能已被外部删除），
+            # 缺失时不沿用旧结果，重新编译并补写。
+            touch_ok = (
+                not body.save_touch
+                or storage.get_touch(cached["touch_id"], cached["touch_version"]) is not None
             )
+            if touch_ok:
+                return JSONResponse(
+                    json.loads(cached["result_json"]), headers={"X-Compile-Cache": "hit"}
+                )
 
         compiled = compile_composition(
             scheme=scheme,
@@ -1021,63 +1032,6 @@ def create_app(db_path: str | None = None) -> FastAPI:
             start_row,
             comp_body.max_calls,
         )
-
-        # 另存不可变 touch 版本：序列为逐 lead 固定 call
-        touch_spec = {
-            "method_id": method["id"],
-            "method_version": method["version"],
-            "start_row": row_to_string(start_row),
-            "calls": {
-                k: {"notation": c["notation"], "replace": c["replace"]}
-                for k, c in sorted(call_defs.items())
-            },
-            "sequence": [
-                {"leads": [{"call": lead.call}], "repeat": 1}
-                for lead in compiled["leads"]
-            ],
-            "max_calls": comp_body.max_calls,
-        }
-        touch_id = body.touch_id or f"compiled:{composition_id}"
-        touch_version = storage.next_touch_version(touch_id)
-        normalized_touch = {
-            "methods": [{"id": method["id"], "version": method["version"],
-                         "name": method["name"], "input_hash": method["input_hash"]}],
-            "start_row": row_to_string(start_row),
-            "calls": {k: {"normalized": c["normalized"], "replace": c["replace"]}
-                      for k, c in sorted(call_defs.items())},
-            "leads": [{"lead": i + 1, "call": lead.call}
-                      for i, lead in enumerate(compiled["leads"])],
-            "total_leads": len(compiled["leads"]),
-            "method_quotas": {},
-            "allowed_transitions": None,
-            "forbidden_transitions": [],
-            "generated_by": {
-                "type": "composition",
-                "composition_id": composition_id,
-                "composition_version": version,
-            },
-        }
-        touch_rec = {
-            "id": touch_id,
-            "version": touch_version,
-            "method_id": method["id"],
-            "method_version": method["version"],
-            "stage": stage,
-            "spec_json": json.dumps(touch_spec, ensure_ascii=False, sort_keys=True),
-            "normalized_json": json.dumps(normalized_touch, ensure_ascii=False),
-            "input_hash": canonical_hash({
-                "kind": "compiled-touch",
-                "composition_id": composition_id,
-                "composition_version": version,
-                "composition_hash": rec["input_hash"],
-                "request_hash": request_hash,
-                "sequence": [(lead.call or "plain") for lead in compiled["leads"]],
-                "start_row": row_to_string(start_row),
-            }),
-            "created_at": utcnow(),
-        }
-        if body.save_touch:
-            storage.insert_touch(touch_rec)
 
         compiled_leads = []
         for rec_lead in compiled["records"]:
@@ -1108,6 +1062,88 @@ def create_app(db_path: str | None = None) -> FastAPI:
         ]
         final_row = compiled["final_row"]
         rounds = tuple(range(1, stage + 1))
+
+        # 另存不可变 touch 版本：序列为逐 lead 固定 call。normalized 的每个
+        # lead 除 lead/call 外，完整保留 part/token/位置/前后 lead head/观察钟
+        # 标注，使 GET /touches 读回时与编译响应一致（spec.sequence 仍是
+        # 最小的 call 序列，供证明引擎重放）。
+        touch_spec = {
+            "method_id": method["id"],
+            "method_version": method["version"],
+            "start_row": row_to_string(start_row),
+            "calls": {
+                k: {"notation": c["notation"], "replace": c["replace"]}
+                for k, c in sorted(call_defs.items())
+            },
+            "sequence": [
+                {"leads": [{"call": lead.call}], "repeat": 1}
+                for lead in compiled["leads"]
+            ],
+            "max_calls": comp_body.max_calls,
+        }
+        normalized_touch = {
+            "methods": [{"id": method["id"], "version": method["version"],
+                         "name": method["name"], "input_hash": method["input_hash"]}],
+            "start_row": row_to_string(start_row),
+            "calls": {k: {"normalized": c["normalized"], "replace": c["replace"]}
+                      for k, c in sorted(call_defs.items())},
+            "leads": [
+                {
+                    "lead": cl["lead"],
+                    "call": cl["call"],
+                    "part": cl["part"],
+                    "part_repeat": cl["part_repeat"],
+                    "part_name": cl["part_name"],
+                    "token": cl["token"],
+                    "symbol": cl["symbol"],
+                    "position": cl["position"],
+                    "lead_head_before": cl["lead_head_before"],
+                    "lead_head_after": cl["lead_head_after"],
+                    "observer_bell": cl["observer_bell"],
+                }
+                for cl in compiled_leads
+            ],
+            "total_leads": len(compiled["leads"]),
+            "method_quotas": {},
+            "allowed_transitions": None,
+            "forbidden_transitions": [],
+            "compiled_tokens": compiled_tokens,
+            "course_heads": compiled["course_heads"],
+            "course_lengths": compiled["course_lengths"],
+            "generated_by": {
+                "type": "composition",
+                "composition_id": composition_id,
+                "composition_version": version,
+                "scheme_id": scheme_rec["id"],
+                "scheme_version": scheme_rec["version"],
+                "observer": scheme_rec["observer"],
+            },
+        }
+        touch_version = None
+        touch_hash = None
+        if body.save_touch:
+            touch_version = storage.next_touch_version(touch_id)
+            touch_hash = canonical_hash({
+                "kind": "compiled-touch",
+                "composition_id": composition_id,
+                "composition_version": version,
+                "composition_hash": rec["input_hash"],
+                "request_hash": request_hash,
+                "sequence": [(lead.call or "plain") for lead in compiled["leads"]],
+                "start_row": row_to_string(start_row),
+            })
+            touch_rec = {
+                "id": touch_id,
+                "version": touch_version,
+                "method_id": method["id"],
+                "method_version": method["version"],
+                "stage": stage,
+                "spec_json": json.dumps(touch_spec, ensure_ascii=False, sort_keys=True),
+                "normalized_json": json.dumps(normalized_touch, ensure_ascii=False),
+                "input_hash": touch_hash,
+                "created_at": utcnow(),
+            }
+            storage.insert_touch(touch_rec)
         payload = {
             "composition_id": composition_id,
             "composition_version": version,
@@ -1132,7 +1168,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
             "expect_rounds": body.expect_rounds,
             "expect_rounds_satisfied": (final_row == rounds) if body.expect_rounds else True,
             "touch": (
-                {"id": touch_id, "version": touch_version, "input_hash": touch_rec["input_hash"]}
+                {"id": touch_id, "version": touch_version, "input_hash": touch_hash}
                 if body.save_touch else None
             ),
             "dependencies": {
@@ -2151,7 +2187,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
                 "input_hash": method["input_hash"] if method else None,
             }
         ]
-        return {
+        detail = {
             "id": rec["id"],
             "version": rec["version"],
             "method": methods_summary[0],
@@ -2168,6 +2204,14 @@ def create_app(db_path: str | None = None) -> FastAPI:
             "input_hash": rec["input_hash"],
             "created_at": rec["created_at"],
         }
+        # 由呼叫位置 composition 编译生成的 touch：附带编译来源与位置标注，
+        # 使 GET 读回与编译响应一致（part/token/位置/前后 lead head/观察钟）。
+        if normalized.get("generated_by"):
+            detail["generated_by"] = normalized["generated_by"]
+            detail["compiled_tokens"] = normalized.get("compiled_tokens", [])
+            detail["course_heads"] = normalized.get("course_heads")
+            detail["course_lengths"] = normalized.get("course_lengths")
+        return detail
 
     def _build_context(body: TouchCreate, methods: list[dict]) -> dict:
         """创建/重建时：校验并展开 touch 结构（对同一输入完全确定）。"""

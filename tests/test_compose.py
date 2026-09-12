@@ -131,6 +131,12 @@ def test_part_mismatch_when_home_unreachable_in_tail(method_ctx, scheme):
     assert ei.value.code == "PART_MISMATCH"
     assert ei.value.details["part"] == 1
     assert len(ei.value.details["candidate_leads"]) == 3
+    # 收尾失败时仍定位到该 part 最后一个 token 与当前排列
+    assert ei.value.details["token"] == {
+        "part": 1, "token": 1, "symbol": "Home", "call": "bob",
+        "plain_leads": 4, "max_plain_leads": None, "target_position": 6,
+    }
+    assert ei.value.details["current_row"] == "142356"
 
 
 def test_two_bobs_in_one_part_return_home(method_ctx, scheme):

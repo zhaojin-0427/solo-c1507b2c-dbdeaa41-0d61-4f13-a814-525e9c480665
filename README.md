@@ -19,6 +19,17 @@ call 来源），并可枚举 call 变体。方法与 touch 以不可变版本�
 method、call），枚举时可设最低总分或规则命中数门槛过滤并参与排序。
 方案版本随 touch 冻结，重复证明与枚举结果一致。
 
+支持**呼叫位置写法（calling positions）编译**：调用方按方法版本创建不可变
+位置方案（指定观察钟与 Home/Wrong/Middle 等符号在 call 结束后的观察钟
+位置，可按 call 给专属映射），再创建由可复用 **part** 组成的 composition；
+每个 token 记录位置符号与 bob、single 或自定义 call，并可用 `plain_leads`
+（精确值）/ `max_plain_leads`（搜索上界）限制此前经过的 plain lead 数。
+系统从指定 course head 逐 lead 推演，位置不可达、限额内匹配不唯一或 part
+接不上时返回出错 token、候选 lead 与当前排列；成功后另存不可变 touch 版本，
+逐 lead 标明 part、token、位置、前后 lead head 与观察钟位置，并返回证明
+结果。位置方案、composition 与生成 touch 的依赖版本冻结，相同输入重复
+编译结果一致。
+
 ## 运行
 
 ```bash
@@ -64,6 +75,11 @@ python3 -m uvicorn ringproof.main:app --port 8765
 | GET | `/prefixes/{id}/versions/{v}` | 前缀冻结状态（当前排列、已出现 row、lead 方法、依赖版本、逐行事件） |
 | GET | `/prefixes/{id}/versions/{v}/rows` | 前缀逐行来源（分页） |
 | POST | `/prefixes/{id}/versions/{v}/continuation` | 续接搜索：目标 row、剩余 lead 上限、方法/call、配额与转换规则、音乐评分，稳定排序+截断进度 |
+| POST | `/position-schemes` | 创建呼叫位置方案版本（观察钟、Home/Wrong/Middle 位置映射、按 call 专属映射；按方法版本冻结） |
+| GET | `/position-schemes/{id}/versions/{v}` | 位置映射、观察钟与方法版本、输入哈希 |
+| POST | `/compositions` | 创建呼叫位置 composition 版本（可复用 part、逐 token 位置符号+call+plain lead 限额） |
+| GET | `/compositions/{id}/versions/{v}` | 规范化 part/token、冻结的位置方案与方法版本、plain course 长度 |
+| POST | `/compositions/{id}/versions/{v}/compile` | 编译为 touch：逐 lead 位置推演+证明，成功另存 touch 版本（按请求内容哈希缓存，`X-Compile-Cache`） |
 
 ### 证明结果字段
 
@@ -259,6 +275,102 @@ change），之后每个完整 lead 末端都入 `results`——**无论是否�
 > 转换白名单只约束**跨方法**转换；**同方法延续始终允许**（即使白名单
 > 非空，也不必显式列出 `["pb","pb"]`）；黑名单始终优先于一切放行。
 
+## 呼叫位置写法：位置方案、composition 与编译
+
+作曲时常用“在 Home / Wrong / Middle 处叫 bob/single”的呼叫位置写法。
+本服务把这种写法编译成逐 lead 的 touch，再走同一套证明流程。
+
+### 1. 位置方案（不可变版本，按方法版本冻结）
+
+```json
+POST /position-schemes
+{
+  "id": "tenor-6", "name": "tenor 观察钟位置",
+  "method_id": "pb-minor",
+  "observer": 6,
+  "positions": {"Home": 6, "Wrong": 4, "Middle": 2},
+  "call_positions": [
+    {"call": "single", "positions": {"Wrong": 4}}
+  ],
+  "home_symbol": "Home"
+}
+```
+
+- `observer` 为观察钟（按钟号）；`positions` 把位置符号映射到 **call 结束
+  （lead end）后观察钟所在位置**（1 起，1 为前端）；
+- `call_positions` 给出某个 call 的专属映射，未列出的符号回落 `positions`；
+- `home_symbol` 指定 home（course end）符号。创建时校验：观察钟/位置不越界
+  （`BELL_OUT_OF_RANGE` / `POSITION_OUT_OF_RANGE`）、home 符号已映射
+  （`HOME_SYMBOL_MISSING`）、观察钟能在 plain course 内回到 home
+  （`HOME_NOT_REACHABLE`），非法方案不落库。
+
+### 2. composition（可复用 part + 逐 token 呼叫）
+
+```json
+POST /compositions
+{
+  "id": "comp", "scheme": {"id": "tenor-6"},
+  "calls": {"bob": {"notation": "14", "replace": 1},
+            "single": {"notation": "1234", "replace": 1}},
+  "parts": [
+    {"name": "A", "repeat": 1, "tokens": [
+      {"symbol": "Wrong", "call": "bob", "plain_leads": 1},
+      {"symbol": "Home", "call": "bob", "plain_leads": 0}
+    ]}
+  ]
+}
+```
+
+- composition 由有序的可复用 **part** 组成，每个 part 可 `repeat`；part 内
+  token 按顺序排列，记录位置符号与 bob/single/自定义 call（`call: null`
+  表示由 plain lead 结束）；
+- `plain_leads` 精确指定此 call 之前经过的 plain lead 数；`max_plain_leads`
+  给出搜索上界；两者皆缺省时在一个 course 窗口内枚举匹配；
+- 创建时拒绝未声明 call（`UNKNOWN_CALL`）、方案未映射的符号
+  （`UNKNOWN_SYMBOL`）与超窗限额（`PLAIN_LEADS_OUT_OF_COURSE`），
+  并冻结位置方案与方法版本。
+
+### 3. 编译
+
+```bash
+curl -X POST localhost:8765/compositions/comp/versions/1/compile \
+  -H 'Content-Type: application/json' \
+  -d '{"course_head": "123456", "touch_id": "touch-A"}'
+```
+
+系统从 `course_head`（缺省 rounds）起逐 lead 推演：先铺 plain lead 再接
+call lead，取 call 结束后观察钟位置唯一命中符号的候选。每个 part 的 token
+解析完后补 plain lead 至观察钟第一次回到 home，下一 part 从该 course head
+继续。失败（HTTP 422）时返回：
+
+| 错误码 | 含义 |
+|---|---|
+| `POSITION_UNREACHABLE` | 限额内没有 lead 能命中符号位置（返回出错 token、候选 lead、当前排列） |
+| `AMBIGUOUS_POSITION` | 限额内多个 lead 命中（返回 `matching_leads` 与全部候选，须收紧 plain lead 限额） |
+| `PART_MISMATCH` | part 最后一个 call 后，course 窗口内观察钟回不到 home（返回该 part 最后一个 token、候选 lead、当前排列） |
+| `SYMBOL_NOT_MAPPED` | 符号在方案中没有映射（该 call 亦无专属映射） |
+| `PLAIN_COURSE_NOT_BOUND` | 起点无法由观察钟自动界定 plain course，须显式给 `course_length` |
+
+成功响应逐 lead 给出编译标注：
+
+- `compiled_tokens` — 每个 token 解析到的 part/token、符号、call、此前
+  plain lead 数、part 内 lead 序号与命中的观察钟位置；
+- `compiled_leads` — 逐 lead 的 `part` / `part_repeat` / `part_name` /
+  `token` / `call` / `symbol` / `position` / `lead_head_before` /
+  `lead_head_after` / `observer_bell`（自动补的 plain lead 的 `token` 为 null）；
+- `course_heads` / `course_lengths`、`final_row`、`rounds_return`；
+- `proof`（真值、rounds 回归、首次重复定位等）与逐行 `events`；
+- `touch` — 另存的不可变 touch 版本；`dependencies` — ringproof、方法、
+  位置方案、composition 与各 call 的冻结版本。
+
+编译缓存键包含 course head、course 长度、`touch_id`、是否保存等全部请求
+输入：**同一份 composition 编译到不同 `touch_id` 会各自落库为独立 touch，
+互不串用缓存**；同一请求重复编译命中缓存（`X-Compile-Cache: hit`）。
+另存的 touch 可直接用既有 `/touches/.../prove`、`/rows` 接口，且
+`GET /touches/{id}/versions/{v}` 读回时每个 lead 仍完整带 part、token、
+position、前后 lead head 与观察钟标注（`generated_by`、`compiled_tokens`、
+`course_heads` 一并读回）。
+
 ## 示例
 
 ```bash
@@ -334,5 +446,5 @@ curl -X POST localhost:8765/prefixes -H 'Content-Type: application/json' -d \
 ## 测试
 
 ```bash
-python3 -m pytest tests/ -q   # 108 个用例
+python3 -m pytest tests/ -q   # 148 个用例
 ```

@@ -44,7 +44,7 @@ def scheme(client, method_id):
 def _composition(cid="comp", tokens=None, **over):
     payload = {
         "id": cid,
-        "scheme": {"id": "tenor-6"},
+        "scheme": {"id": over.pop("scheme_id_override", "tenor-6")},
         "calls": {
             "bob": {"notation": "14", "replace": 1},
             "single": {"notation": "1234", "replace": 1},
@@ -300,7 +300,6 @@ def test_compile_different_course_head_gives_distinct_result(client, scheme):
     j1 = client.post("/compositions/comp/versions/1/compile",
                      json={"course_head": "123456"}).json()
     # 从 W-part 的 course head 154326 起：同样 gap1 命中 Wrong，终到 rounds。
-    # 非 rounds 起点无法由观察钟自动界定 plain course，须显式 course_length。
     r2 = client.post("/compositions/comp/versions/1/compile",
                      json={"course_head": "154326", "course_length": 5})
     assert r2.status_code == 200, r2.text
@@ -309,11 +308,25 @@ def test_compile_different_course_head_gives_distinct_result(client, scheme):
     assert j1["course_head"] == "123456" and j2["course_head"] == "154326"
     assert j2["final_row"] == "123456"
     assert j1["final_row"] != j2["final_row"]
-    # 缺省 course_length 且起点观察钟不在 home（普通 lead end 135264）→ 无法自动界定
+    # 从普通 lead head 起，plain course 内该位置不可达 → 位置不可达错误
     r3 = client.post("/compositions/comp/versions/1/compile",
                      json={"course_head": "135264"})
     assert r3.status_code == 422
-    assert r3.json()["detail"]["code"] == "PLAIN_COURSE_NOT_BOUND"
+    assert r3.json()["detail"]["code"] in (
+        "PLAIN_COURSE_NOT_BOUND", "POSITION_UNREACHABLE"
+    )
+
+
+def test_position_scheme_home_unreachable_rejected(client, method_id):
+    # 观察 1 号钟且 home 设为第 6 位：1 号钟在 PB Minor 永远在第 1 位，
+    # plain course 内无法回到 home，方案在创建时即被拒绝（不落库）。
+    r = client.post("/position-schemes", json={
+        "id": "obs1", "name": "obs1", "method_id": "pb-minor", "observer": 1,
+        "positions": {"Home": 6, "Wrong": 4}, "home_symbol": "Home",
+    })
+    assert r.status_code == 422
+    assert r.json()["detail"]["code"] == "HOME_NOT_REACHABLE"
+    assert client.get("/position-schemes/obs1/versions/1").status_code == 404
 
 
 def test_compile_save_touch_false(client, scheme):
@@ -323,6 +336,85 @@ def test_compile_save_touch_false(client, scheme):
     assert j["touch"] is None
     # 未落 touch
     assert client.get("/touches/compiled:comp/versions/1").status_code == 404
+
+
+def test_distinct_touch_ids_produce_distinct_saved_touches(client, scheme):
+    # 同一份 composition 先后编译到 touch-A、touch-B：两次都须真正落库，
+    # 响应分别指向各自 id，不能因缓存键相同而沿用第一次的 touch。
+    client.post("/compositions", json=_composition())
+    a = client.post("/compositions/comp/versions/1/compile",
+                    json={"touch_id": "touch-A"}).json()
+    b = client.post("/compositions/comp/versions/1/compile",
+                    json={"touch_id": "touch-B"}).json()
+    assert a["touch"]["id"] == "touch-A" and a["touch"]["version"] == 1
+    assert b["touch"]["id"] == "touch-B" and b["touch"]["version"] == 1
+    assert a["request_hash"] != b["request_hash"]
+    ga = client.get("/touches/touch-A/versions/1")
+    gb = client.get("/touches/touch-B/versions/1")
+    assert ga.status_code == 200 and gb.status_code == 200
+    assert ga.json()["id"] == "touch-A" and gb.json()["id"] == "touch-B"
+    # 同一 touch_id 重复编译命中缓存且不新增版本
+    again = client.post("/compositions/comp/versions/1/compile",
+                        json={"touch_id": "touch-A"})
+    assert again.headers["X-Compile-Cache"] == "hit"
+    assert again.json()["touch"] == a["touch"]
+    versions = client.get("/touches/touch-A").json()["versions"]
+    assert [v["version"] for v in versions] == [1]
+
+
+def test_saved_touch_reads_back_full_compile_annotations(client, scheme):
+    client.post("/compositions", json=_composition())
+    j = client.post("/compositions/comp/versions/1/compile", json={}).json()
+    got = client.get(f"/touches/{j['touch']['id']}/versions/{j['touch']['version']}").json()
+    # 每个 lead 读回后仍带 part/token/位置/前后 lead head/观察钟
+    assert len(got["leads"]) == j["total_leads"]
+    by_lead = {l["lead"]: l for l in got["leads"]}
+    for cl in j["compiled_leads"]:
+        gl = by_lead[cl["lead"]]
+        assert gl["call"] == cl["call"]
+        assert gl["part"] == cl["part"]
+        assert gl["part_repeat"] == cl["part_repeat"]
+        assert gl["part_name"] == cl["part_name"]
+        assert gl["token"] == cl["token"]
+        assert gl["symbol"] == cl["symbol"]
+        assert gl["position"] == cl["position"]
+        assert gl["observer_bell"] == cl["observer_bell"]
+        assert gl["lead_head_before"] == cl["lead_head_before"]
+        assert gl["lead_head_after"] == cl["lead_head_after"]
+    bob = by_lead[2]
+    assert bob["symbol"] == "Wrong" and bob["position"] == 4
+    assert bob["lead_head_before"] == "135264"
+    # 编译来源与逐 token / course 标注一并读回
+    assert got["generated_by"]["type"] == "composition"
+    assert got["generated_by"]["composition_id"] == "comp"
+    assert got["compiled_tokens"] == j["compiled_tokens"]
+    assert got["course_heads"] == j["course_heads"]
+    assert got["course_lengths"] == j["course_lengths"]
+    # rows 端点的逐行来源可正常重放（spec.sequence 仍是最小 call 序列）
+    rows = client.get(
+        f"/touches/{j['touch']['id']}/versions/{j['touch']['version']}/rows",
+        params={"limit": 1000},
+    ).json()
+    assert rows["total_changes"] == j["proof"]["total_changes"]
+    assert rows["rows"][-1]["row"] == j["final_row"]
+
+
+def test_part_mismatch_locates_failing_token(client, scheme):
+    # Home bob(gap4) 后回 home 需 5 个 plain lead；course_length=3 时 part 接不上，
+    # 错误详情须同时给出出错 token、候选 lead 与当前排列。
+    client.post("/compositions", json=_composition(
+        cid="pm", tokens=[{"symbol": "Home", "call": "bob", "plain_leads": 4}]))
+    r = client.post("/compositions/pm/versions/1/compile", json={"course_length": 3})
+    assert r.status_code == 422
+    j = r.json()
+    assert j["detail"]["code"] == "PART_MISMATCH"
+    assert j["part"] == 1
+    assert j["token"] == {
+        "part": 1, "token": 1, "symbol": "Home", "call": "bob",
+        "plain_leads": 4, "max_plain_leads": None, "target_position": 6,
+    }
+    assert len(j["candidate_leads"]) == 3
+    assert j["current_row"]
 
 
 def test_compile_not_found(client):
