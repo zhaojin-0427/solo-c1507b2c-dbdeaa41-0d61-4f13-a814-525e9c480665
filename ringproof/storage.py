@@ -1,9 +1,11 @@
-"""SQLite 不可变版本存储：方法、touch、音乐评分方案与证明结果。
+"""SQLite 不可变版本存储：方法、touch、音乐评分方案、呼叫位置方案、
+composition 与编译（compilation）结果。
 
-方法、touch 与评分方案以 (id, version) 为主键只增不改；证明结果以
-(touch_id, touch_version, music_id, music_version) 为主键缓存，
-保证同一版本（含所引用的评分方案版本）重复证明结果一致。
-touch_music 记录 touch 版本首次引用某评分方案时冻结的版本。
+方法、touch、评分方案、位置方案与 composition 以 (id, version) 为主键只增
+不改；证明结果以 (touch_id, touch_version, music_id, music_version) 为主键
+缓存，编译结果以 (composition_id, composition_version, request_hash) 为主键
+缓存，保证同一版本重复证明/编译结果一致。touch_music 记录 touch 版本首次
+引用某评分方案时冻结的版本。
 """
 from __future__ import annotations
 
@@ -100,6 +102,42 @@ CREATE TABLE IF NOT EXISTS continuations (
     result_json TEXT NOT NULL,
     created_at TEXT NOT NULL,
     PRIMARY KEY (prefix_id, prefix_version, request_hash)
+);
+CREATE TABLE IF NOT EXISTS position_schemes (
+    id TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    method_id TEXT NOT NULL,
+    method_version INTEGER NOT NULL,
+    stage INTEGER NOT NULL,
+    observer INTEGER NOT NULL,
+    spec_json TEXT NOT NULL,
+    input_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (id, version)
+);
+CREATE TABLE IF NOT EXISTS compositions (
+    id TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    method_id TEXT NOT NULL,
+    method_version INTEGER NOT NULL,
+    stage INTEGER NOT NULL,
+    spec_json TEXT NOT NULL,
+    normalized_json TEXT NOT NULL,
+    input_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (id, version)
+);
+CREATE TABLE IF NOT EXISTS compilations (
+    composition_id TEXT NOT NULL,
+    composition_version INTEGER NOT NULL,
+    request_hash TEXT NOT NULL,
+    input_hash TEXT NOT NULL,
+    touch_id TEXT NOT NULL,
+    touch_version INTEGER NOT NULL,
+    result_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (composition_id, composition_version, request_hash)
 );
 """
 
@@ -455,6 +493,140 @@ class Storage:
                     rec["prefix_version"],
                     rec["request_hash"],
                     rec["input_hash"],
+                    rec["result_json"],
+                    rec["created_at"],
+                ),
+            )
+            self._conn.commit()
+
+    # ---------------- 呼叫位置方案 ----------------
+    def next_position_version(self, scheme_id: str) -> int:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT MAX(version) AS v FROM position_schemes WHERE id = ?",
+                (scheme_id,),
+            ).fetchone()
+        return (row["v"] or 0) + 1
+
+    def insert_position_scheme(self, rec: dict) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO position_schemes"
+                " (id, version, name, method_id, method_version, stage, observer,"
+                " spec_json, input_hash, created_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (
+                    rec["id"],
+                    rec["version"],
+                    rec["name"],
+                    rec["method_id"],
+                    rec["method_version"],
+                    rec["stage"],
+                    rec["observer"],
+                    rec["spec_json"],
+                    rec["input_hash"],
+                    rec["created_at"],
+                ),
+            )
+            self._conn.commit()
+
+    def get_position_scheme(self, scheme_id: str, version: int) -> dict | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM position_schemes WHERE id = ? AND version = ?",
+                (scheme_id, version),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def latest_position_version(self, scheme_id: str) -> int | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT MAX(version) AS v FROM position_schemes WHERE id = ?",
+                (scheme_id,),
+            ).fetchone()
+        return row["v"]
+
+    def list_position_schemes(self) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, version, name, method_id, method_version, stage, observer,"
+                " input_hash, created_at FROM position_schemes ORDER BY id, version"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ---------------- composition（呼叫位置写法） ----------------
+    def next_composition_version(self, composition_id: str) -> int:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT MAX(version) AS v FROM compositions WHERE id = ?",
+                (composition_id,),
+            ).fetchone()
+        return (row["v"] or 0) + 1
+
+    def insert_composition(self, rec: dict) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO compositions"
+                " (id, version, method_id, method_version, stage,"
+                " spec_json, normalized_json, input_hash, created_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?)",
+                (
+                    rec["id"],
+                    rec["version"],
+                    rec["method_id"],
+                    rec["method_version"],
+                    rec["stage"],
+                    rec["spec_json"],
+                    rec["normalized_json"],
+                    rec["input_hash"],
+                    rec["created_at"],
+                ),
+            )
+            self._conn.commit()
+
+    def get_composition(self, composition_id: str, version: int) -> dict | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM compositions WHERE id = ? AND version = ?",
+                (composition_id, version),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def list_compositions(self) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, version, method_id, method_version, stage, input_hash,"
+                " created_at FROM compositions ORDER BY id, version"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ---------------- 编译结果 ----------------
+    def get_compilation(
+        self, composition_id: str, composition_version: int, request_hash: str
+    ) -> dict | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM compilations"
+                " WHERE composition_id = ? AND composition_version = ?"
+                " AND request_hash = ?",
+                (composition_id, composition_version, request_hash),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def insert_compilation(self, rec: dict) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO compilations"
+                " (composition_id, composition_version, request_hash, input_hash,"
+                " touch_id, touch_version, result_json, created_at)"
+                " VALUES (?,?,?,?,?,?,?,?)",
+                (
+                    rec["composition_id"],
+                    rec["composition_version"],
+                    rec["request_hash"],
+                    rec["input_hash"],
+                    rec["touch_id"],
+                    rec["touch_version"],
                     rec["result_json"],
                     rec["created_at"],
                 ),

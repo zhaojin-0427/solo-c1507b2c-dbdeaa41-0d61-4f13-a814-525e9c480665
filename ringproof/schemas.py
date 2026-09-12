@@ -300,6 +300,138 @@ class PrefixCreate(BaseModel):
         return self
 
 
+# ---------------- 呼叫位置写法（calling positions） ----------------
+
+
+class PositionSchemeRef(BaseModel):
+    """引用一个位置方案的不可变版本；version 留空则在创建 composition 时冻结为最新。"""
+
+    id: str
+    version: int | None = Field(default=None, ge=1, description="留空则引用该方案的最新版本（随 composition 冻结）")
+
+
+class CallPositions(BaseModel):
+    """某个 call 对位置符号的专属映射；未覆盖的符号回落方案的 default 映射。"""
+
+    call: str = Field(description="call 名称（bob/single/自定义，不能为保留字 plain）")
+    positions: dict[str, int] = Field(
+        min_length=1, description="该 call 结束后位置符号 → 观察钟位置（1 起）"
+    )
+
+
+class PositionSchemeCreate(BaseModel):
+    """创建呼叫位置方案版本（不可变，按方法版本冻结）。
+
+    positions 给出 Home/Wrong/Middle 等符号在 call 结束（lead end）后观察钟
+    的位置；call_positions 为 bob/single/自定义 call 的专属映射，未覆盖符号
+    回落 positions。home_symbol 指定 home（course end）符号。
+    """
+
+    id: str | None = Field(default=None, description="留空则自动生成；同名 id 递增版本")
+    name: str = Field(min_length=1, max_length=200)
+    method_id: str = Field(description="方法 id（位置推演按该方法的不可变版本冻结）")
+    method_version: int | None = Field(default=None, ge=1, description="留空则冻结为创建时最新版本")
+    observer: int = Field(ge=1, le=12, description="观察钟（按钟号，1..stage）")
+    positions: dict[str, int] = Field(
+        min_length=1, description="位置符号 → call 结束后的观察钟位置（1 起）"
+    )
+    call_positions: list[CallPositions] = Field(
+        default_factory=list, description="各 call 的专属位置映射（可缺省，回落 positions）"
+    )
+    home_symbol: str = Field(default="Home", description="home（course end）位置符号")
+
+    @field_validator("positions")
+    @classmethod
+    def _check_positions(cls, v: dict[str, int]) -> dict[str, int]:
+        if not all(isinstance(k, str) and k for k in v):
+            raise ValueError("位置符号须为非空字符串")
+        if any(p < 1 for p in v.values()):
+            raise ValueError("观察钟位置须 ≥ 1")
+        return v
+
+
+class PositionToken(BaseModel):
+    """composition 中的一个呼叫：位置符号 + call，并可限制此前经过的 plain lead 数。
+
+    plain_leads（精确值）与 max_plain_leads（搜索上界）只能二选一；两者都
+    缺省时在一个 plain course 内枚举匹配。
+    """
+
+    symbol: str = Field(min_length=1, description="位置符号，如 Home/Wrong/Middle")
+    call: str | None = Field(
+        default=None,
+        description="call 名称（bob/single/自定义）；null 表示该位置由 plain lead 结束",
+    )
+    plain_leads: int | None = Field(
+        default=None, ge=0,
+        description="此 call 之前须恰好经过的 plain lead 数（自 course head 或上一个 call 起）",
+    )
+    max_plain_leads: int | None = Field(
+        default=None, ge=0,
+        description="此 call 之前至多经过的 plain lead 数；缺省则枚举一个 plain course",
+    )
+
+    @model_validator(mode="after")
+    def _check(self) -> "PositionToken":
+        if self.plain_leads is not None and self.max_plain_leads is not None:
+            raise ValueError("plain_leads 与 max_plain_leads 只能二选一")
+        if self.call is not None:
+            _validate_call_ref(self.call)
+        return self
+
+
+class CompositionPart(BaseModel):
+    """composition 中可复用的一个 part：有序 token 列表 + 重复次数。"""
+
+    tokens: list[PositionToken] = Field(min_length=1, description="该 part 的呼叫序列")
+    repeat: int = Field(default=1, ge=1, le=1000, description="该 part 重复次数")
+    name: str | None = Field(default=None, max_length=100, description="part 名称（可缺省）")
+
+
+class CompositionCreate(BaseModel):
+    """创建呼叫位置 composition 版本（不可变，冻结位置方案与方法版本）。
+
+    composition 由可复用 part 组成；calls 给出 bob/single/自定义 call 的
+    place notation，call 名在整个 composition 内唯一。
+    """
+
+    id: str | None = Field(default=None, description="留空则自动生成；同名 id 递增版本")
+    name: str | None = Field(default=None, max_length=200)
+    scheme: PositionSchemeRef = Field(description="位置方案引用（版本可随 composition 冻结）")
+    calls: dict[str, CallDef] = Field(
+        default_factory=dict, description="bob/single/自定义 call 定义；token 中引用的 call 须在此声明"
+    )
+    parts: list[CompositionPart] = Field(min_length=1, description="可复用 part 列表（按顺序展开 repeat）")
+    start_row: str | None = Field(default=None, description="起始排列（第一个 course head），缺省为 rounds")
+    max_calls: int | None = Field(default=None, ge=0, description="允许的替换（call）次数上限")
+
+    @field_validator("calls")
+    @classmethod
+    def _check_call_names(cls, v: dict[str, CallDef]) -> dict[str, CallDef]:
+        for name in v:
+            _validate_call_ref(name)
+        return v
+
+
+class CompileRequest(BaseModel):
+    """编译请求：可指定起始 course head、plain course 长度与末行要求。"""
+
+    course_head: str | None = Field(
+        default=None, description="起始 course head 排列；缺省用 composition 冻结的 start_row（rounds）"
+    )
+    course_length: int | None = Field(
+        default=None, ge=1, le=500,
+        description="一个 plain course 的 lead 数（搜索/收尾窗口）；缺省时由观察钟回 home 自动界定",
+    )
+    expect_rounds: bool = Field(
+        default=True, description="是否要求末行回到 rounds（不影响编译落库，仅在结果中标注是否满足）"
+    )
+    touch_id: str | None = Field(
+        default=None, description="另存 touch 版本时使用的 id；留空则按 composition id 派生",
+    )
+    save_touch: bool = Field(default=True, description="成功后是否另存为不可变 touch 版本")
+
+
 class ContinueRequest(BaseModel):
     """在前缀之后搜索续接尾段。
 

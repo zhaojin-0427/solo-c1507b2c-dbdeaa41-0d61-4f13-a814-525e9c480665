@@ -17,6 +17,7 @@ from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse
 
 from . import __version__
+from .compose import ComposeError, compile_composition, plain_course_length
 from .continuation import search_continuations
 from .engine import (
     ExpandedLead,
@@ -37,15 +38,19 @@ from .notation import (
 from .prefix import replay_prefix
 from .schemas import (
     CallDef,
+    CompileRequest,
+    CompositionCreate,
     ContinueRequest,
     EnumerateRequest,
     MethodCreate,
     MethodRef,
     MusicSchemeCreate,
+    PositionSchemeCreate,
     PrefixCreate,
     ProveRequest,
     TouchCreate,
 )
+from .schemas import _validate_call_ref
 from .storage import Storage, canonical_hash, utcnow
 
 MAX_LEADS = 5000  # 单个 touch 展开后的 lead 数上限
@@ -73,6 +78,13 @@ def create_app(db_path: str | None = None) -> FastAPI:
     @app.exception_handler(TouchError)
     async def touch_error_handler(_: Request, exc: TouchError):
         return JSONResponse(status_code=422, content={"detail": {"code": exc.code, "message": exc.message}})
+
+    @app.exception_handler(ComposeError)
+    async def compose_error_handler(_: Request, exc: ComposeError):
+        return JSONResponse(
+            status_code=422,
+            content={"detail": {"code": exc.code, "message": exc.message}, **exc.details},
+        )
 
     # ---------- 方法 ----------
     @app.post("/methods", status_code=201)
@@ -614,6 +626,596 @@ def create_app(db_path: str | None = None) -> FastAPI:
             response["min_music_score"] = body.min_music_score
             response["min_music_hits"] = body.min_music_hits
         return response
+
+    # ---------- 呼叫位置方案 ----------
+    @app.post("/position-schemes", status_code=201)
+    def create_position_scheme(body: PositionSchemeCreate):
+        """创建呼叫位置方案的不可变版本（按方法版本冻结观察钟与位置映射）。
+
+        home 符号须存在且能由 plain lead end 到达；位置越界或 call 名重复
+        在此被拒绝（不落库）。call 专属映射仅在 composition 编译时随该
+        composition 声明的 call 记号参与推演。"""
+        mv = body.method_version or storage.latest_method_version(body.method_id)
+        method = storage.get_method(body.method_id, mv) if mv else None
+        if not method:
+            detail = (
+                f"方法不存在: {body.method_id}"
+                if body.method_version is None
+                else f"方法版本不存在: {body.method_id} v{body.method_version}"
+            )
+            return JSONResponse(status_code=404, content={"detail": detail})
+        stage = method["stage"]
+        if not 1 <= body.observer <= stage:
+            return JSONResponse(
+                status_code=422,
+                content={"detail": {"code": "BELL_OUT_OF_RANGE",
+                                    "message": f"观察钟 {body.observer} 超出 {stage} 口钟范围"}},
+            )
+        positions: dict[str, int] = {}
+        for symbol, pos in body.positions.items():
+            if not 1 <= pos <= stage:
+                return JSONResponse(
+                    status_code=422,
+                    content={"detail": {"code": "POSITION_OUT_OF_RANGE",
+                                        "message": f"符号 {symbol!r} 的位置 {pos} 超出 1..{stage}"}},
+                )
+            positions[symbol] = pos
+        if body.home_symbol not in positions:
+            return JSONResponse(
+                status_code=422,
+                content={"detail": {"code": "HOME_SYMBOL_MISSING",
+                                    "message": f"home 符号 {body.home_symbol!r} 未在 positions 中给出映射"}},
+            )
+        call_positions: dict[str, dict[str, int]] = {}
+        for cp in body.call_positions:
+            if cp.call in call_positions:
+                return JSONResponse(
+                    status_code=422,
+                    content={"detail": {"code": "DUPLICATE_CALL",
+                                        "message": f"call 位置映射重复: {cp.call!r}"}},
+                )
+            try:
+                _validate_call_ref(cp.call)
+            except ValueError:
+                return JSONResponse(
+                    status_code=422,
+                    content={"detail": {"code": "INVALID_CALL_NAME",
+                                        "message": f"非法 call 名: {cp.call!r}"}},
+                )
+            mapped: dict[str, int] = {}
+            for symbol, pos in cp.positions.items():
+                if not 1 <= pos <= stage:
+                    return JSONResponse(
+                        status_code=422,
+                        content={"detail": {"code": "POSITION_OUT_OF_RANGE",
+                                            "message": f"call {cp.call!r} 的符号 {symbol!r} 位置 {pos} 超出 1..{stage}"}},
+                    )
+                mapped[symbol] = pos
+            call_positions[cp.call] = mapped
+
+        # home 可达性：从 rounds 起只敲 plain lead，观察钟须在 plain course
+        # 内回到 home 位置（这是后续 part 收尾与 course 界定的前提）。
+        method_ctx = _method_ctx(method, {})
+        home_position = positions[body.home_symbol]
+        start = tuple(range(1, stage + 1))
+        course_len = plain_course_length(method_ctx, start, body.observer, home_position, limit=200)
+        if course_len is None:
+            return JSONResponse(
+                status_code=422,
+                content={"detail": {"code": "HOME_NOT_REACHABLE",
+                                    "message": f"观察钟 {body.observer} 号钟无法在 plain course（200 个 plain lead）"
+                                               f"内回到 home（{body.home_symbol}，第 {home_position} 位）"}},
+            )
+
+        scheme_id = body.id or _new_id()
+        version = storage.next_position_version(scheme_id)
+        spec = {
+            "name": body.name,
+            "method_id": body.method_id,
+            "method_version": mv,
+            "observer": body.observer,
+            "positions": dict(sorted(positions.items())),
+            "call_positions": {k: dict(sorted(v.items())) for k, v in sorted(call_positions.items())},
+            "home_symbol": body.home_symbol,
+        }
+        rec = {
+            "id": scheme_id,
+            "version": version,
+            "name": body.name,
+            "method_id": body.method_id,
+            "method_version": mv,
+            "stage": stage,
+            "observer": body.observer,
+            "spec_json": json.dumps(spec, ensure_ascii=False, sort_keys=True),
+            "input_hash": canonical_hash({**spec, "method_hash": method["input_hash"]}),
+            "created_at": utcnow(),
+        }
+        try:
+            storage.insert_position_scheme(rec)
+        except sqlite3.IntegrityError:
+            return JSONResponse(status_code=409, content={"detail": "该 (id, version) 已存在，版本不可变"})
+        return _position_detail(rec)
+
+    @app.get("/position-schemes")
+    def list_position_schemes():
+        return {"position_schemes": storage.list_position_schemes()}
+
+    @app.get("/position-schemes/{scheme_id}")
+    def list_position_scheme_versions(scheme_id: str):
+        versions = [m for m in storage.list_position_schemes() if m["id"] == scheme_id]
+        if not versions:
+            return JSONResponse(status_code=404, content={"detail": f"位置方案不存在: {scheme_id}"})
+        return {"id": scheme_id, "versions": versions}
+
+    @app.get("/position-schemes/{scheme_id}/versions/{version}")
+    def get_position_scheme(scheme_id: str, version: int):
+        rec = storage.get_position_scheme(scheme_id, version)
+        if not rec:
+            return JSONResponse(status_code=404, content={"detail": f"位置方案版本不存在: {scheme_id} v{version}"})
+        return _position_detail(rec)
+
+    # ---------- composition（呼叫位置写法） ----------
+    @app.post("/compositions", status_code=201)
+    def create_composition(body: CompositionCreate):
+        """创建呼叫位置 composition 的不可变版本，冻结位置方案与方法版本。"""
+        sv = body.scheme.version or storage.latest_position_version(body.scheme.id)
+        scheme_rec = storage.get_position_scheme(body.scheme.id, sv) if sv else None
+        if not scheme_rec:
+            detail = (
+                f"位置方案不存在: {body.scheme.id}"
+                if body.scheme.version is None
+                else f"位置方案版本不存在: {body.scheme.id} v{body.scheme.version}"
+            )
+            return JSONResponse(status_code=404, content={"detail": detail})
+        scheme_spec = json.loads(scheme_rec["spec_json"])
+        method = storage.get_method(scheme_rec["method_id"], scheme_rec["method_version"])
+        if not method:
+            return JSONResponse(
+                status_code=422,
+                content={"detail": {"code": "METHOD_MISSING",
+                                    "message": f"位置方案引用的方法版本缺失: {scheme_rec['method_id']} "
+                                               f"v{scheme_rec['method_version']}"}},
+            )
+        stage = method["stage"]
+        ch = json.loads(method["changes_json"])
+        method_ctx = {
+            "tokens": ch["tokens"],
+            "changes": [frozenset(p) for p in ch["places"]],
+            "call_defs": {},
+            "method_id": method["id"],
+            "method_version": method["version"],
+            "method_name": method["name"],
+        }
+
+        # call 定义展开 + replace 范围
+        call_defs: dict[str, dict] = {}
+        for name, c in body.calls.items():
+            try:
+                ctoks, cchanges = expand_notation(c.notation, stage)
+            except NotationError as e:
+                return JSONResponse(status_code=422, content={"detail": {"code": e.code, "message": e.message}})
+            if not 1 <= c.replace <= len(ch["tokens"]):
+                return JSONResponse(
+                    status_code=422,
+                    content={"detail": {"code": "CALL_REPLACE_RANGE",
+                                        "message": f"call {name!r} 替换 {c.replace} 个 change，超出 lead 长度 {len(ch['tokens'])}"}},
+                )
+            call_defs[name] = {
+                "notation": c.notation,
+                "normalized": ".".join(ctoks),
+                "tokens": ctoks,
+                "changes": cchanges,
+                "replace": c.replace,
+            }
+        method_ctx["call_defs"] = call_defs
+
+        # token 校验：符号须在方案映射中（该 call 专属或 default）；call 须已声明；
+        # plain_leads（call 前经过的 plain lead 数）须在 course 窗口内
+        positions = scheme_spec["positions"]
+        call_positions = scheme_spec.get("call_positions", {})
+        home_symbol = scheme_spec["home_symbol"]
+        observer = scheme_rec["observer"]
+        start_row = parse_row(body.start_row, stage) if body.start_row else tuple(range(1, stage + 1))
+        course_len = plain_course_length(
+            method_ctx, start_row, observer, positions[home_symbol], limit=200
+        )
+        window = course_len or 200
+        normalized_parts: list[dict] = []
+        total_leads_bound = 0
+        for p_idx, part in enumerate(body.parts, 1):
+            norm_tokens = []
+            for t_idx, tok in enumerate(part.tokens, 1):
+                call_name = tok.call
+                if call_name is not None and call_name not in call_defs:
+                    return JSONResponse(
+                        status_code=422,
+                        content={"detail": {"code": "UNKNOWN_CALL",
+                                            "message": f"第 {p_idx} part 第 {t_idx} 个 token 引用了未定义的 call: {call_name!r}"}},
+                    )
+                per_call = call_positions.get(call_name or "")
+                if tok.symbol not in positions and not (per_call and tok.symbol in per_call):
+                    return JSONResponse(
+                        status_code=422,
+                        content={"detail": {"code": "UNKNOWN_SYMBOL",
+                                            "message": f"第 {p_idx} part 第 {t_idx} 个 token 引用了方案未映射的位置符号: {tok.symbol!r}"}},
+                    )
+                if tok.plain_leads is not None and tok.plain_leads >= window:
+                    return JSONResponse(
+                        status_code=422,
+                        content={"detail": {"code": "PLAIN_LEADS_OUT_OF_COURSE",
+                                            "message": f"第 {p_idx} part 第 {t_idx} 个 token 的 plain_leads="
+                                                       f"{tok.plain_leads} 达到或超过一个 course 窗口（{window} 个 lead）"}},
+                    )
+                if tok.max_plain_leads is not None and tok.max_plain_leads >= window:
+                    return JSONResponse(
+                        status_code=422,
+                        content={"detail": {"code": "PLAIN_LEADS_OUT_OF_COURSE",
+                                            "message": f"第 {p_idx} part 第 {t_idx} 个 token 的 max_plain_leads="
+                                                       f"{tok.max_plain_leads} 达到或超过一个 course 窗口（{window} 个 lead）"}},
+                    )
+                norm_tokens.append({
+                    "token": t_idx,
+                    "symbol": tok.symbol,
+                    "call": call_name,
+                    "plain_leads": tok.plain_leads,
+                    "max_plain_leads": tok.max_plain_leads,
+                })
+            normalized_parts.append({
+                "part": p_idx,
+                "name": part.name,
+                "repeat": part.repeat,
+                "tokens": norm_tokens,
+            })
+            total_leads_bound += part.repeat * (window * (len(part.tokens) + 1))
+        if total_leads_bound > MAX_LEADS * (window + 1):
+            return JSONResponse(
+                status_code=422,
+                content={"detail": {"code": "TOO_MANY_LEADS",
+                                    "message": f"composition 展开规模过大（上限约 {MAX_LEADS} 个 lead）"}},
+            )
+
+        composition_id = body.id or _new_id()
+        version = storage.next_composition_version(composition_id)
+        input_hash = canonical_hash({
+            "scheme": {"id": scheme_rec["id"], "version": scheme_rec["version"], "hash": scheme_rec["input_hash"]},
+            "method": {"id": method["id"], "version": method["version"], "hash": method["input_hash"]},
+            "stage": stage,
+            "start_row": row_to_string(start_row),
+            "calls": {k: {"notation": call_defs[k]["notation"], "replace": call_defs[k]["replace"]}
+                      for k in sorted(call_defs)},
+            "parts": [p.model_dump() for p in body.parts],
+            "max_calls": body.max_calls,
+        })
+        normalized = {
+            "scheme": {"id": scheme_rec["id"], "version": scheme_rec["version"],
+                       "name": scheme_rec["name"], "input_hash": scheme_rec["input_hash"]},
+            "method": {"id": method["id"], "version": method["version"],
+                       "name": method["name"], "input_hash": method["input_hash"]},
+            "stage": stage,
+            "start_row": row_to_string(start_row),
+            "plain_course_length": course_len,
+            "calls": {k: {"normalized": c["normalized"], "replace": c["replace"]}
+                      for k, c in sorted(call_defs.items())},
+            "parts": normalized_parts,
+        }
+        rec = {
+            "id": composition_id,
+            "version": version,
+            "method_id": method["id"],
+            "method_version": method["version"],
+            "stage": stage,
+            "spec_json": json.dumps(body.model_dump(), ensure_ascii=False, sort_keys=True),
+            "normalized_json": json.dumps(normalized, ensure_ascii=False),
+            "input_hash": input_hash,
+            "created_at": utcnow(),
+        }
+        try:
+            storage.insert_composition(rec)
+        except sqlite3.IntegrityError:
+            return JSONResponse(status_code=409, content={"detail": "该 (id, version) 已存在，版本不可变"})
+        return _composition_detail(rec)
+
+    @app.get("/compositions")
+    def list_compositions():
+        return {"compositions": storage.list_compositions()}
+
+    @app.get("/compositions/{composition_id}")
+    def list_composition_versions(composition_id: str):
+        versions = [m for m in storage.list_compositions() if m["id"] == composition_id]
+        if not versions:
+            return JSONResponse(status_code=404, content={"detail": f"composition 不存在: {composition_id}"})
+        return {"id": composition_id, "versions": versions}
+
+    @app.get("/compositions/{composition_id}/versions/{version}")
+    def get_composition(composition_id: str, version: int):
+        rec = storage.get_composition(composition_id, version)
+        if not rec:
+            return JSONResponse(status_code=404, content={"detail": f"composition 版本不存在: {composition_id} v{version}"})
+        return _composition_detail(rec)
+
+    @app.post("/compositions/{composition_id}/versions/{version}/compile")
+    def compile_composition_endpoint(composition_id: str, version: int, body: CompileRequest | None = None):
+        """把呼叫位置写法编译为 touch：逐 lead 推演位置、解析 call，成功后另存
+        不可变 touch 版本并返回证明结果；失败返回出错 token、候选 lead 与当前
+        排列。相同输入重复编译结果一致（按请求内容哈希缓存）。"""
+        body = body or CompileRequest()
+        rec = storage.get_composition(composition_id, version)
+        if not rec:
+            return JSONResponse(status_code=404, content={"detail": f"composition 版本不存在: {composition_id} v{version}"})
+        spec = json.loads(rec["spec_json"])
+        comp_body = CompositionCreate(**spec)
+        scheme_rec = storage.get_position_scheme(comp_body.scheme.id, _frozen_scheme_version(rec, comp_body))
+        scheme_spec = json.loads(scheme_rec["spec_json"])
+        method = storage.get_method(rec["method_id"], rec["method_version"])
+        stage = rec["stage"]
+        ch = json.loads(method["changes_json"])
+
+        call_defs: dict[str, dict] = {}
+        for name, c in comp_body.calls.items():
+            ctoks, cchanges = expand_notation(c.notation, stage)
+            call_defs[name] = {
+                "notation": c.notation,
+                "normalized": ".".join(ctoks),
+                "tokens": ctoks,
+                "changes": cchanges,
+                "replace": c.replace,
+            }
+        method_ctx = {
+            "tokens": ch["tokens"],
+            "changes": [frozenset(p) for p in ch["places"]],
+            "call_defs": call_defs,
+            "method_id": method["id"],
+            "method_version": method["version"],
+            "method_name": method["name"],
+        }
+        scheme = {
+            "observer": scheme_rec["observer"],
+            "home_symbol": scheme_spec["home_symbol"],
+            "positions": scheme_spec["positions"],
+            "call_positions": scheme_spec.get("call_positions", {}),
+        }
+        comp_start = parse_row(comp_body.start_row, stage) if comp_body.start_row else tuple(range(1, stage + 1))
+        start_row = parse_row(body.course_head, stage) if body.course_head else comp_start
+
+        parts: list[dict] = []
+        for part in comp_body.parts:
+            for rep in range(1, part.repeat + 1):
+                parts.append({
+                    "name": part.name,
+                    "repeat_index": rep,
+                    "tokens": [t.model_dump() for t in part.tokens],
+                })
+
+        request_key = {
+            "course_head": row_to_string(start_row),
+            "course_length": body.course_length,
+            "expect_rounds": body.expect_rounds,
+            "save_touch": body.save_touch,
+            "composition_hash": rec["input_hash"],
+            "ringproof_version": __version__,
+        }
+        request_hash = canonical_hash(request_key)
+        cached = storage.get_compilation(composition_id, version, request_hash)
+        if cached and cached["input_hash"] == rec["input_hash"]:
+            return JSONResponse(
+                json.loads(cached["result_json"]), headers={"X-Compile-Cache": "hit"}
+            )
+
+        compiled = compile_composition(
+            scheme=scheme,
+            method_ctx=method_ctx,
+            parts=parts,
+            start_row=start_row,
+            course_length=body.course_length,
+        )
+        if len(compiled["leads"]) > MAX_LEADS:
+            raise ComposeError(
+                "TOO_MANY_LEADS",
+                f"编译后共 {len(compiled['leads'])} 个 lead，超过上限 {MAX_LEADS}",
+            )
+
+        proof = prove_rows(
+            stage,
+            method["name"],
+            compiled["leads"],
+            start_row,
+            comp_body.max_calls,
+        )
+
+        # 另存不可变 touch 版本：序列为逐 lead 固定 call
+        touch_spec = {
+            "method_id": method["id"],
+            "method_version": method["version"],
+            "start_row": row_to_string(start_row),
+            "calls": {
+                k: {"notation": c["notation"], "replace": c["replace"]}
+                for k, c in sorted(call_defs.items())
+            },
+            "sequence": [
+                {"leads": [{"call": lead.call}], "repeat": 1}
+                for lead in compiled["leads"]
+            ],
+            "max_calls": comp_body.max_calls,
+        }
+        touch_id = body.touch_id or f"compiled:{composition_id}"
+        touch_version = storage.next_touch_version(touch_id)
+        normalized_touch = {
+            "methods": [{"id": method["id"], "version": method["version"],
+                         "name": method["name"], "input_hash": method["input_hash"]}],
+            "start_row": row_to_string(start_row),
+            "calls": {k: {"normalized": c["normalized"], "replace": c["replace"]}
+                      for k, c in sorted(call_defs.items())},
+            "leads": [{"lead": i + 1, "call": lead.call}
+                      for i, lead in enumerate(compiled["leads"])],
+            "total_leads": len(compiled["leads"]),
+            "method_quotas": {},
+            "allowed_transitions": None,
+            "forbidden_transitions": [],
+            "generated_by": {
+                "type": "composition",
+                "composition_id": composition_id,
+                "composition_version": version,
+            },
+        }
+        touch_rec = {
+            "id": touch_id,
+            "version": touch_version,
+            "method_id": method["id"],
+            "method_version": method["version"],
+            "stage": stage,
+            "spec_json": json.dumps(touch_spec, ensure_ascii=False, sort_keys=True),
+            "normalized_json": json.dumps(normalized_touch, ensure_ascii=False),
+            "input_hash": canonical_hash({
+                "kind": "compiled-touch",
+                "composition_id": composition_id,
+                "composition_version": version,
+                "composition_hash": rec["input_hash"],
+                "request_hash": request_hash,
+                "sequence": [(lead.call or "plain") for lead in compiled["leads"]],
+                "start_row": row_to_string(start_row),
+            }),
+            "created_at": utcnow(),
+        }
+        if body.save_touch:
+            storage.insert_touch(touch_rec)
+
+        compiled_leads = []
+        for rec_lead in compiled["records"]:
+            compiled_leads.append({
+                "lead": rec_lead.lead,
+                "part": rec_lead.part,
+                "part_repeat": rec_lead.part_repeat,
+                "part_name": rec_lead.part_name,
+                "token": rec_lead.token,
+                "call": rec_lead.call,
+                "symbol": rec_lead.symbol,
+                "position": rec_lead.observer_position,
+                "lead_head_before": rec_lead.lead_head_before,
+                "lead_head_after": rec_lead.lead_head_after,
+                "observer_bell": scheme_rec["observer"],
+            })
+        compiled_tokens = [
+            {
+                "part": t.part,
+                "token": t.token,
+                "symbol": t.symbol,
+                "call": t.call,
+                "plain_leads": t.plain_leads_before,
+                "lead_index_in_part": t.lead_index,
+                "position": t.observer_position,
+            }
+            for t in compiled["compiled_tokens"]
+        ]
+        final_row = compiled["final_row"]
+        rounds = tuple(range(1, stage + 1))
+        payload = {
+            "composition_id": composition_id,
+            "composition_version": version,
+            "input_hash": rec["input_hash"],
+            "request_hash": request_hash,
+            "course_head": row_to_string(start_row),
+            "course_heads": compiled["course_heads"],
+            "course_lengths": compiled["course_lengths"],
+            "scheme": {
+                "id": scheme_rec["id"],
+                "version": scheme_rec["version"],
+                "name": scheme_rec["name"],
+                "observer": scheme_rec["observer"],
+                "home_symbol": scheme_spec["home_symbol"],
+                "input_hash": scheme_rec["input_hash"],
+            },
+            "compiled_tokens": compiled_tokens,
+            "compiled_leads": compiled_leads,
+            "total_leads": len(compiled["leads"]),
+            "final_row": row_to_string(final_row),
+            "rounds_return": final_row == rounds,
+            "expect_rounds": body.expect_rounds,
+            "expect_rounds_satisfied": (final_row == rounds) if body.expect_rounds else True,
+            "touch": (
+                {"id": touch_id, "version": touch_version, "input_hash": touch_rec["input_hash"]}
+                if body.save_touch else None
+            ),
+            "dependencies": {
+                "ringproof_version": __version__,
+                "method": {"id": method["id"], "version": method["version"], "input_hash": method["input_hash"]},
+                "position_scheme": {"id": scheme_rec["id"], "version": scheme_rec["version"],
+                                    "input_hash": scheme_rec["input_hash"]},
+                "composition": {"id": composition_id, "version": version, "input_hash": rec["input_hash"]},
+                "calls": {
+                    k: {"notation": c["notation"], "replace": c["replace"]}
+                    for k, c in sorted(call_defs.items())
+                },
+            },
+            "proof": {
+                k: v
+                for k, v in proof.items()
+                if k != "events"
+            },
+            "events": proof["events"],
+        }
+        if body.save_touch:
+            storage.insert_compilation({
+                "composition_id": composition_id,
+                "composition_version": version,
+                "request_hash": request_hash,
+                "input_hash": rec["input_hash"],
+                "touch_id": touch_id,
+                "touch_version": touch_version,
+                "result_json": json.dumps(payload, ensure_ascii=False),
+                "created_at": utcnow(),
+            })
+        return JSONResponse(payload, headers={"X-Compile-Cache": "miss"})
+
+    def _frozen_scheme_version(rec: dict, comp_body: CompositionCreate) -> int:
+        """composition 记录中冻结的位置方案版本（spec 中版本留空时取 normalized）。"""
+        normalized = json.loads(rec["normalized_json"])
+        return normalized["scheme"]["version"]
+
+    def _method_ctx(method: dict, call_defs: dict[str, dict]) -> dict:
+        ch = json.loads(method["changes_json"])
+        return {
+            "tokens": ch["tokens"],
+            "changes": [frozenset(p) for p in ch["places"]],
+            "call_defs": call_defs,
+            "method_id": method["id"],
+            "method_version": method["version"],
+            "method_name": method["name"],
+        }
+
+    def _position_detail(rec: dict) -> dict:
+        spec = json.loads(rec["spec_json"])
+        return {
+            "id": rec["id"],
+            "version": rec["version"],
+            "name": rec["name"],
+            "method": {"id": rec["method_id"], "version": rec["method_version"]},
+            "stage": rec["stage"],
+            "observer": rec["observer"],
+            "positions": spec["positions"],
+            "call_positions": spec.get("call_positions", {}),
+            "home_symbol": spec["home_symbol"],
+            "input_hash": rec["input_hash"],
+            "created_at": rec["created_at"],
+        }
+
+    def _composition_detail(rec: dict) -> dict:
+        spec = json.loads(rec["spec_json"])
+        normalized = json.loads(rec["normalized_json"])
+        return {
+            "id": rec["id"],
+            "version": rec["version"],
+            "name": spec.get("name"),
+            "stage": rec["stage"],
+            "scheme": normalized["scheme"],
+            "method": normalized["method"],
+            "start_row": normalized["start_row"],
+            "plain_course_length": normalized.get("plain_course_length"),
+            "calls": normalized["calls"],
+            "parts": normalized["parts"],
+            "max_calls": spec.get("max_calls"),
+            "input_hash": rec["input_hash"],
+            "created_at": rec["created_at"],
+        }
 
     # ---------- 部分 touch：前缀校核 ----------
     @app.post("/prefixes", status_code=201)
