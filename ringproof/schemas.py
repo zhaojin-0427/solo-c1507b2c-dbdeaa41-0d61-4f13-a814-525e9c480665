@@ -45,7 +45,7 @@ class CallDef(BaseModel):
     """lead end 处的 call：用一段记号替换方法末尾 replace 个 change。"""
 
     notation: str = Field(min_length=1, description="call 的 place notation（可含 &、+、重复段）")
-    replace: int = Field(default=1, ge=1, le=64, description="替换 lead 末尾的 change 数")
+    replace: int = Field(default=1, ge=1, description="替换 lead 末尾的 change 数（越界由服务端按 lead 长度拒绝）")
 
 
 class LeadSpec(BaseModel):
@@ -754,4 +754,60 @@ class FalsenessAnalysisCreate(BaseModel):
             raise ValueError("methods 列表存在重复的方法 id")
         if len(set(self.mutable_bells)) != len(self.mutable_bells):
             raise ValueError("mutable_bells 存在重复钟号")
+        return self
+
+
+# ---------------- Lead-head 可达图 ----------------
+
+
+class LeadGraphCreate(BaseModel):
+    """创建 lead-head 可达图的独立分析版本（引用不可变方法版本）。
+
+    以起始 lead head 为状态、plain/bob/single/自定义 call 为动作建图：
+    call 在 lead end 处替换方法末尾 ``replace`` 个 change。目标排列须为
+    与方法同钟数的完整排列（1～20 个）；路线可避开禁用 lead head。
+    """
+
+    id: str | None = Field(default=None, description="留空则自动生成；同名 id 递增版本")
+    name: str | None = Field(default=None, max_length=200)
+    method: MethodRef = Field(description="引用一个方法的不可变版本（版本留空则冻结为最新）")
+    start_lead_head: str | None = Field(
+        default=None, description="起始 lead head（1..stage 的完整排列），缺省为 rounds"
+    )
+    calls: dict[str, CallDef] = Field(
+        default_factory=dict, description="bob/single/自定义 call 定义；plain 恒可用且无需定义"
+    )
+    targets: list[str] = Field(
+        min_length=1, max_length=20, description="目标排列列表（1~20 个，须为完整排列，同钟数）"
+    )
+    forbidden_lead_heads: list[str] = Field(
+        default_factory=list, description="禁用 lead head：路线不得经过（起点本身禁用则拒绝创建）"
+    )
+    max_leads: int = Field(
+        default=20, ge=1, le=500, description="路线/展开的最大 lead 数"
+    )
+    max_states: int = Field(
+        default=10000, ge=1, le=200000, description="可达 lead head 状态上限（超出截断）"
+    )
+    max_routes: int = Field(
+        default=10, ge=1, le=100, description="每个目标最多返回的同长度最短候选路线数"
+    )
+    true_search_budget: int = Field(
+        default=20000, ge=1, le=2_000_000,
+        description="为真路线搜索的边访问预算（超出截断并标注 true_route_truncated）",
+    )
+
+    @field_validator("calls")
+    @classmethod
+    def _check_call_names(cls, v: dict[str, CallDef]) -> dict[str, CallDef]:
+        for name in v:
+            _validate_call_ref(name)
+        return v
+
+    @model_validator(mode="after")
+    def _check_duplicates(self) -> "LeadGraphCreate":
+        if len(set(self.targets)) != len(self.targets):
+            raise ValueError("targets 列表存在重复目标排列")
+        if len(set(self.forbidden_lead_heads)) != len(self.forbidden_lead_heads):
+            raise ValueError("forbidden_lead_heads 列表存在重复排列")
         return self

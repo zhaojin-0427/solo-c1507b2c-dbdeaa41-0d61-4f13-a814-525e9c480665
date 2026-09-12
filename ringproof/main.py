@@ -10,6 +10,9 @@
 组合。方法相假图谱：以 course head 为独立分析对象，接入不可变方法版本，
 枚举可变钟排列（≤720 个 course head）并展开 plain course，按共享 row
 关系汇总相假矩阵、首次冲突与连通分组，分析版本写入 SQLite。
+lead-head 可达图：以 lead head 为节点、plain/bob/single/自定义 call 为
+有向边，逐层 BFS 建图并返回目标可达性、最短动作序列、同长度备选数、
+候选路线逐 row 真值、为真路线、强连通分量、无法返回起点的区域与截断原因。
 """
 from __future__ import annotations
 
@@ -51,6 +54,12 @@ from .notation import (
     validate_stage,
 )
 from .prefix import replay_prefix
+from .reachability import (
+    MAX_TARGETS,
+    ReachabilityError,
+    analyze_reachability,
+    build_variants,
+)
 from .schemas import (
     BlockCompositionCreate,
     BlockSearchRequest,
@@ -61,6 +70,7 @@ from .schemas import (
     CoverageSchemeCreate,
     EnumerateRequest,
     FalsenessAnalysisCreate,
+    LeadGraphCreate,
     MethodCreate,
     MethodRef,
     MultipartAnalysisCreate,
@@ -117,6 +127,10 @@ def create_app(db_path: str | None = None) -> FastAPI:
 
     @app.exception_handler(FalsenessError)
     async def falseness_error_handler(_: Request, exc: FalsenessError):
+        return JSONResponse(status_code=422, content={"detail": {"code": exc.code, "message": exc.message}})
+
+    @app.exception_handler(ReachabilityError)
+    async def reachability_error_handler(_: Request, exc: ReachabilityError):
         return JSONResponse(status_code=422, content={"detail": {"code": exc.code, "message": exc.message}})
 
     # ---------- 方法 ----------
@@ -2191,6 +2205,215 @@ def create_app(db_path: str | None = None) -> FastAPI:
                 "total_courses": len(all_courses),
                 "returned_courses": len(kept),
             }
+        return payload
+
+    # ---------- lead-head 可达图 ----------
+    @app.post("/lead-graph-analyses", status_code=201)
+    def create_lead_graph_analysis(body: LeadGraphCreate):
+        """创建 lead-head 可达图的独立分析版本：引用不可变方法版本（留空则
+        冻结为最新），把 plain/bob/single/自定义 call 对 lead head 的转移
+        保存为分析版本。排列不完整、call 替换越界或目标钟数不符在此拒绝
+        （不落库）。"""
+        mv = body.method.version or storage.latest_method_version(body.method.id)
+        method = storage.get_method(body.method.id, mv) if mv else None
+        if not method:
+            detail = (
+                f"方法不存在: {body.method.id}"
+                if body.method.version is None
+                else f"方法版本不存在: {body.method.id} v{body.method.version}"
+            )
+            return JSONResponse(status_code=404, content={"detail": detail})
+        stage = method["stage"]
+
+        # 排列解析：起始/目标/禁用 lead head 均须为 1..stage 的完整排列，
+        # 非法排列经 NotationError 处理器返回 422（ROW_NOT_PERMUTATION 等）
+        start = (
+            parse_row(body.start_lead_head, stage)
+            if body.start_lead_head
+            else tuple(range(1, stage + 1))
+        )
+        targets = [parse_row(t, stage) for t in body.targets]
+        forbidden = {parse_row(h, stage) for h in body.forbidden_lead_heads}
+
+        # call 记号按方法钟数展开（记号非法返回 422 NotationError）
+        call_defs: dict[str, dict] = {}
+        for name in sorted(body.calls):
+            spec = body.calls[name]
+            ctoks, cchanges = expand_notation(spec.notation, stage)
+            call_defs[name] = {
+                "name": name,
+                "replace": spec.replace,
+                "tokens": ctoks,
+                "changes": cchanges,
+            }
+        mch = json.loads(method["changes_json"])
+        method_tokens = mch["tokens"]
+        method_places = [frozenset(pl) for pl in mch["places"]]
+        variants = build_variants(method_tokens, method_places, call_defs)
+
+        result = analyze_reachability(
+            {"id": method["id"], "version": method["version"], "name": method["name"]},
+            start,
+            variants,
+            targets,
+            forbidden,
+            body.max_leads,
+            body.max_states,
+            body.max_routes,
+            body.true_search_budget,
+        )
+        graph = result["graph"]
+
+        analysis_id = body.id or _new_id()
+        version = storage.next_lead_graph_version(analysis_id)
+
+        # 边与节点：转为 JSON 行格式
+        nodes_str = [row_to_string(r) for r in graph["nodes"]]
+        edges_payload = [
+            {
+                "from": e["from"],
+                "to": e["to"],
+                "lead_head_before": nodes_str[e["from"]],
+                "lead_head_after": nodes_str[e["to"]],
+                "action": e["action"],
+                "call": e["call"],
+                "changes": e["changes"],
+            }
+            for e in graph["edges"]
+        ]
+        components_payload = [
+            {
+                "id": ci,
+                "size": len(comp),
+                "nodes": comp,
+                "lead_heads": [nodes_str[i] for i in comp],
+            }
+            for ci, comp in enumerate(result["components"], 1)
+        ]
+        no_return = result["no_return"]
+
+        frozen_calls = {
+            name: {"notation": body.calls[name].notation,
+                   "replace": body.calls[name].replace,
+                   "notation_normalized": ".".join(call_defs[name]["tokens"])}
+            for name in sorted(body.calls)
+        }
+        spec = {
+            "name": body.name,
+            "stage": stage,
+            "method": {"id": method["id"], "version": method["version"]},
+            "start_lead_head": row_to_string(start),
+            "calls": frozen_calls,
+            "targets": [row_to_string(t) for t in targets],
+            "forbidden_lead_heads": graph["forbidden"],
+            "max_leads": body.max_leads,
+            "max_states": body.max_states,
+            "max_routes": body.max_routes,
+            "true_search_budget": body.true_search_budget,
+        }
+        input_hash = canonical_hash(
+            {
+                **spec,
+                "method": {
+                    "id": method["id"],
+                    "version": method["version"],
+                    "hash": method["input_hash"],
+                },
+                "ringproof_version": __version__,
+            }
+        )
+        payload = {
+            "id": analysis_id,
+            "version": version,
+            "name": body.name,
+            "stage": stage,
+            "method": {"id": method["id"], "version": method["version"],
+                       "name": method["name"]},
+            "start_lead_head": row_to_string(start),
+            "calls": frozen_calls,
+            "actions": [v.action for v in variants],
+            "targets_input": [row_to_string(t) for t in targets],
+            "forbidden_lead_heads": graph["forbidden"],
+            "max_leads": body.max_leads,
+            "max_states": body.max_states,
+            "max_routes": body.max_routes,
+            "true_search_budget": body.true_search_budget,
+            "graph": {
+                "nodes": nodes_str,
+                "edges": edges_payload,
+                "num_nodes": len(nodes_str),
+                "num_edges": len(edges_payload),
+                "blocked_transitions": graph["blocked"],
+            },
+            "targets": result["targets"],
+            "components": components_payload,
+            "cannot_return": {
+                "count": len(no_return),
+                "nodes": no_return,
+                "lead_heads": [nodes_str[i] for i in no_return],
+            },
+            "truncated": graph["truncated"],
+            "truncation_reason": graph["truncation_reason"],
+            "truncation_limit": graph["limit"],
+            "dependencies": {
+                "ringproof_version": __version__,
+                "method": {"id": method["id"], "version": method["version"],
+                           "input_hash": method["input_hash"]},
+                "calls": frozen_calls,
+            },
+            "input_hash": input_hash,
+            "created_at": utcnow(),
+        }
+        rec = {
+            "id": analysis_id,
+            "version": version,
+            "stage": stage,
+            "method_id": method["id"],
+            "method_version": method["version"],
+            "spec_json": json.dumps(spec, ensure_ascii=False, sort_keys=True),
+            "result_json": json.dumps(payload, ensure_ascii=False),
+            "input_hash": input_hash,
+            "created_at": payload["created_at"],
+        }
+        try:
+            storage.insert_lead_graph(rec)
+        except sqlite3.IntegrityError:
+            return JSONResponse(status_code=409, content={"detail": "该 (id, version) 已存在，版本不可变"})
+        return JSONResponse(payload, status_code=201)
+
+    @app.get("/lead-graph-analyses")
+    def list_lead_graph_analyses():
+        return {"lead_graph_analyses": storage.list_lead_graphs()}
+
+    @app.get("/lead-graph-analyses/{analysis_id}")
+    def list_lead_graph_versions(analysis_id: str):
+        versions = [f for f in storage.list_lead_graphs() if f["id"] == analysis_id]
+        if not versions:
+            return JSONResponse(status_code=404, content={"detail": f"可达图分析不存在: {analysis_id}"})
+        return {"id": analysis_id, "versions": versions}
+
+    @app.get("/lead-graph-analyses/{analysis_id}/versions/{version}")
+    def get_lead_graph_analysis(
+        analysis_id: str,
+        version: int,
+        only_true: bool = Query(False, description="只返回为真的候选路线（首选路线为假时置空）"),
+    ):
+        """读取 lead-head 可达图分析版本：目标可达性、最短动作序列、同长度
+        备选数、候选路线逐 row 真值、为真路线、强连通分量、无法返回起点的
+        区域与截断原因。only_true=true 时各目标只保留 truth 为 true 的路线。
+        分析冻结方法、call、约束与输入哈希，重复查询结果一致。"""
+        rec = storage.get_lead_graph(analysis_id, version)
+        if not rec:
+            return JSONResponse(status_code=404, content={"detail": f"可达图分析版本不存在: {analysis_id} v{version}"})
+        payload = json.loads(rec["result_json"])
+        if only_true:
+            for t in payload["targets"]:
+                true_routes = [r for r in t["routes"] if r["truth"] == "true"]
+                t["routes"] = true_routes
+                t["routes_returned"] = len(true_routes)
+                if t["preferred_route"] is not None and t["preferred_route"]["truth"] != "true":
+                    t["preferred_route"] = t["true_route"]
+            payload["filter"] = "only_true"
         return payload
 
     # ---------- 部分 touch：前缀校核 ----------

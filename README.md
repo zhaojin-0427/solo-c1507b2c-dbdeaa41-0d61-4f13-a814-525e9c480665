@@ -59,6 +59,18 @@ block 数与 call 数排序；结果冻结 touch、方法与 call 依赖，相�
 与 change，并按共享 row 关系生成连通分组；可筛选内部为真且彼此无共享
 row 的组合。分析版本写入 SQLite，重复查询保持一致。
 
+支持 **lead-head 可达图**：把 plain、bob、single 与自定义 call 对
+lead head 的转移保存为**独立分析版本**，并引用不可变方法版本。调用方提交
+起始 lead head、call 定义（在 lead end 替换方法末尾若干 change）、
+1～20 个目标排列、最大 lead 数与状态上限；排列不完整、call 替换越界或
+目标钟数不符时拒绝创建。系统逐层 BFS 生成有向图（边记录 call、前后排列
+与完整 lead 的 change 数），返回每个目标的可达性、最短动作序列、同长度
+备选数、按 lead 数/call 数/动作字典序排列的候选路线及其逐 row 真值、
+预算内的为真路线、强连通分量、无法返回起点的区域与截断原因；路线可避开
+禁用 lead head（起点本身禁用则拒绝创建）。重复 row 追溯两处 method、
+lead、change 与 call，也可用 `only_true=true` 只看为真的路线。分析冻结
+方法、call、约束与输入哈希，重复查询保持一致。
+
 ## 运行
 
 ```bash
@@ -119,6 +131,8 @@ python3 -m uvicorn ringproof.main:app --port 8765
 | POST | `/block-compositions/{id}/versions/{v}/search` | 搜索满足用量/衔接/长度/末行的 block 组合（可达性/剩余长度/行交集剪枝、冲突两侧来源；按请求哈希缓存，`X-Block-Search-Cache`） |
 | POST | `/falseness-analyses` | 创建方法相假图谱版本（同钟数方法 + 参考 course head + 2~6 口可变钟；枚举 ≤720 个 course head 展开 plain course；冻结方法版本） |
 | GET | `/falseness-analyses/{id}/versions/{v}` | 各 course 闭合长度与内部真值、共享 row 矩阵、首次冲突、连通分组、截断状态与检查数量；`only_true_disjoint=true` 筛选为真且互不相交的组合 |
+| POST | `/lead-graph-analyses` | 创建 lead-head 可达图版本（引用不可变方法版本；起始 lead head、call 定义、1~20 目标、max_leads、max_states、禁用 lead head） |
+| GET | `/lead-graph-analyses/{id}/versions/{v}` | 图节点/边、目标可达性/最短动作序列/同长度备选数/候选路线逐 row 真值/为真路线、强连通分量、无法返回起点区域、截断原因；`only_true=true` 只返回为真路线 |
 
 ### 证明结果字段
 
@@ -645,6 +659,90 @@ POST /falseness-analyses
 `filter` / `total_courses` / `returned_courses`，matrix/groups 仍为完整
 分析）。分析版本写入 SQLite，同一版本重复查询结果一致。
 
+## lead-head 可达图
+
+把每个 lead head 当作图节点，把 plain lead 与 bob / single / 自定义 call
+当作有向边：从某个 lead head 敲完一个完整 lead 到达新的 lead head。系统
+逐层 BFS 生成可达图，帮助作曲者判断哪些 lead head 可达、最短怎么到、有
+多少种等价走法、哪些区域一去不返，以及沿哪些动作序列敲过去整条路线为真。
+plain/bob/single/自定义 call 对 lead head 的转移保存为**独立分析版本**，
+并**引用不可变方法版本**（方法更新不影响已冻结分析）。
+
+### 1. 创建分析（不可变版本）
+
+```json
+POST /lead-graph-analyses
+{
+  "id": "lg",
+  "method": {"id": "pb-minor"},
+  "start_lead_head": "123456",
+  "calls": {
+    "bob": {"notation": "14", "replace": 1},
+    "single": {"notation": "1234", "replace": 1}
+  },
+  "targets": ["135264", "156342", "123456"],
+  "forbidden_lead_heads": [],
+  "max_leads": 20,
+  "max_states": 10000,
+  "max_routes": 10,
+  "true_search_budget": 20000
+}
+```
+
+- `method` 引用一个不可变方法版本（`version` 留空则冻结为创建时最新）；
+  call 的 place notation 按方法钟数展开，`replace` 为在 lead end 替换的
+  末尾 change 数（`plain` 恒可用，无需也不允许定义）；
+- `start_lead_head` 缺省为 rounds；`targets` 为 1～20 个完整排列；
+  `forbidden_lead_heads` 声明路线不得经过的 lead head（落入禁用 head 的
+  边计入 `blocked_transitions`，起点本身禁用返回 422 `START_FORBIDDEN`）；
+- `max_leads`（默认 20，≤500）为路线 lead 上限；`max_states`（默认 10000，
+  ≤200000）为可达 lead head 状态上限，超出截断；`max_routes` 为每个目标
+  返回的同长度最短候选路线上限；`true_search_budget` 为为真路线搜索的
+  边访问预算；
+- 创建时拒绝（不落库）：不完整排列（`ROW_NOT_PERMUTATION` /
+  `ROW_LENGTH_MISMATCH`，目标钟数不符同样按长度/排列错误拒绝）、call
+  记号非法（记号错误码）、`CALL_REPLACE_RANGE`（替换越界）、重复目标或
+  保留 call 名 `plain`（422）、方法版本缺失（404）。
+
+### 2. 分析结果
+
+- `graph` — `nodes`（去重 lead head，按发现顺序）、`edges`（每条边记录
+  `action`、`call`、`lead_head_before`/`lead_head_after`、`changes`）、
+  `num_nodes`/`num_edges` 与落入禁用 head 的 `blocked_transitions`；
+- `targets` — 逐目标：
+  - `reachable` / `distance`（最短 lead 数）/ `shortest_sequence`（动作名
+    序列，目标即起点时为空列表）/ `alternative_count`（同长度动作序列数，
+    **精确整数**，按 BFS 父节点路径数求和，不做浮点截断）；
+  - `preferred_route` — 同长度中 **call 数最少、动作字典序最小**的路线，
+    含逐 lead 的 call、前后 lead head 与 change 数；
+  - `routes` — 至多 `max_routes` 条按 **call 数 → 动作字典序**排列的
+    同长度候选，每条附 `truth`（逐 row 校核）与 `first_repeat`；
+    `routes_truncated` 表示候选数是否超过返回上限；
+  - `true_route` — 迭代加深 DFS 找到的**为真路线**（逐 row 无重复，末 row
+    回到起点属正常 come-round），优先最短、call 最少、字典序；
+    `true_route_truncated` / `true_search_edges_checked` 说明预算；
+- `components` — 强连通分量（含单点分量，按分量内最小 lead head 排序），
+  每分量给出 `nodes` 下标与 `lead_heads`；
+- `cannot_return` — 图中无法沿边回到起点的节点（`nodes` 下标与
+  `lead_heads`）；
+- `truncated` / `truncation_limit`（`max_leads` 或 `max_states`）/
+  `truncation_reason`；
+- `dependencies` / `input_hash`：冻结 ringproof 版本、方法版本（含方法
+  内容哈希）、call 定义与全部约束；同一版本重复 GET 结果一致。
+
+重复 row 的 `first_repeat` 给出两处来源 `method`、`lead`（0 表示起点）、
+`change_in_lead`、全局 `change` 与该 lead 的 `call`。
+
+### 3. 只看为真的路线
+
+```bash
+curl localhost:8765/lead-graph-analyses/lg/versions/1?only_true=true
+```
+
+各目标的 `routes` 只保留 `truth == "true"` 的候选（响应附
+`"filter": "only_true"`）；首选路线若为假，`preferred_route` 回落到为真
+路线。完整分析（图、分量、无回区域）保持不变。
+
 ## 示例
 
 ```bash
@@ -750,10 +848,27 @@ curl -X POST localhost:8765/multipart-analyses/mp/versions/1/enumerate \
   -H 'Content-Type: application/json' -d '{"parts":5}'
 # → 5 个结果（每个 1-lead 区段、parts=5），pruned_by_orbit/pruned_by_rows
 #   给出剪枝计数；重复请求命中缓存（X-Multipart-Cache: hit）
+
+# 14. lead-head 可达图：plain/bob/single 对 lead head 的转移（独立分析版本）
+curl -X POST localhost:8765/lead-graph-analyses -H 'Content-Type: application/json' -d \
+  '{"id":"lg","method":{"id":"pb-minor"},
+    "calls":{"bob":{"notation":"14","replace":1},
+             "single":{"notation":"1234","replace":1}},
+    "targets":["135264","156342","123456"],"max_leads":20}'
+# → graph 120 节点/360 边、单个强连通分量、无不可回区域；
+#   135264 距离 1（plain）、123456 的为真路线为 bob,bob,bob（36 change 回 rounds）
+
+# 15. 避开禁用 lead head，只看为真的候选路线
+curl -X POST localhost:8765/lead-graph-analyses -H 'Content-Type: application/json' -d \
+  '{"id":"lg2","method":{"id":"pb-minor"},
+    "calls":{"bob":{"notation":"14","replace":1}},
+    "targets":["156342"],"forbidden_lead_heads":["135264"]}'
+curl 'localhost:8765/lead-graph-analyses/lg2/versions/1?only_true=true'
+# → blocked_transitions ≥ 1；所有候选路线均不经过 135264，routes 只保留为真者
 ```
 
 ## 测试
 
 ```bash
-python3 -m pytest tests/ -q   # 234 个用例
+python3 -m pytest tests/ -q   # 264 个用例
 ```
