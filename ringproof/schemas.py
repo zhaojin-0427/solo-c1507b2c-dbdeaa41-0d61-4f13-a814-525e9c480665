@@ -552,3 +552,75 @@ class ContinueRequest(BaseModel):
         if (self.min_music_score is not None or self.min_music_hits is not None) and self.music is None:
             raise ValueError("设置音乐门槛（min_music_score/min_music_hits）时必须引用评分方案 music")
         return self
+
+
+# ---------------- multipart composition 校核 ----------------
+
+
+class TouchRef(BaseModel):
+    """引用一个 touch 的不可变版本；version 留空则在创建分析时冻结为最新版本。"""
+
+    id: str
+    version: int | None = Field(default=None, ge=1, description="留空则引用该 touch 的最新版本（随分析冻结）")
+
+
+class MultipartAnalysisCreate(BaseModel):
+    """创建 multipart composition 校核的不可变版本。
+
+    从不可变 touch 选取首尾落在 lead end 的连续区段作为一个 part（起始
+    change 0 表示 touch 起始 row），系统求出区段起止 row 间的钟置换并
+    反复作用展开整首 composition：各 part 无须重复提交 row。
+    """
+
+    id: str | None = Field(default=None, description="留空则自动生成；同名 id 递增版本")
+    touch: TouchRef = Field(description="part 区段所在的不可变 touch（版本随分析冻结）")
+    part_start_change: int = Field(
+        ge=0, description="part 区段起始 change 序号（0 为 touch 起始 row；须为 lead end）"
+    )
+    part_end_change: int = Field(
+        ge=1, description="part 区段结束 change 序号（须为 lead end）"
+    )
+    expected_parts: int = Field(
+        ge=1, le=500, description="预期 part 数：区段置换反复作用的次数"
+    )
+    fixed_bells: list[int] = Field(
+        default_factory=list,
+        description="必须保持原位的钟：区段置换须将这些钟固定（1..stage，不重复）",
+    )
+
+    @model_validator(mode="after")
+    def _check(self) -> "MultipartAnalysisCreate":
+        if self.part_start_change >= self.part_end_change:
+            raise ValueError("part_start_change 须小于 part_end_change")
+        if len(set(self.fixed_bells)) != len(self.fixed_bells):
+            raise ValueError("fixed_bells 存在重复钟号")
+        return self
+
+
+class MultipartEnumerateRequest(BaseModel):
+    """在分析冻结的 touch 中枚举整首为真的 multipart composition。
+
+    候选为全部首尾落在 lead end 的连续区段；先按 fixed bells 与轨道长度
+    （part 数须等于置换的阶）剪枝，再做行交集扫描，只保留整首为真的结果，
+    沿用 touch 中的位置顺序返回。
+    """
+
+    parts: int | None = Field(
+        default=None, ge=2, le=500,
+        description="精确 part 数（置换的阶须恰为该值）；缺省用 min_parts..max_parts 范围",
+    )
+    min_parts: int = Field(default=2, ge=2, le=500, description="最小 part 数")
+    max_parts: int = Field(default=64, ge=2, le=500, description="最大 part 数")
+    max_results: int = Field(default=50, ge=1, le=500, description="最多返回的结果数")
+    max_search: int = Field(
+        default=20000, ge=1, le=2_000_000,
+        description="搜索预算：最多检查的候选区段数，超出则截断并说明原因",
+    )
+
+    @model_validator(mode="after")
+    def _check(self) -> "MultipartEnumerateRequest":
+        if self.parts is not None:
+            self.min_parts = self.max_parts = self.parts
+        if self.min_parts > self.max_parts:
+            raise ValueError("min_parts 不能大于 max_parts")
+        return self

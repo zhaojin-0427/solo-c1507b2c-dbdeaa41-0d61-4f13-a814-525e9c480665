@@ -1,12 +1,13 @@
 """SQLite 不可变版本存储：方法、touch、音乐评分方案、all-the-work 覆盖方案、
-呼叫位置方案、composition 与编译（compilation）结果。
+呼叫位置方案、composition 与编译（compilation）结果、multipart 校核分析。
 
-方法、touch、评分方案、覆盖方案、位置方案与 composition 以 (id, version) 为
-主键只增不改；证明结果以 (touch_id, touch_version, music_id, music_version,
-coverage_id, coverage_version) 为主键缓存，编译结果以 (composition_id,
-composition_version, request_hash) 为主键缓存，保证同一版本重复证明/编译结果
-一致。touch_music / touch_coverage 分别记录 touch 版本首次引用某评分/覆盖
-方案时冻结的版本。
+方法、touch、评分方案、覆盖方案、位置方案、composition 与 multipart 分析以
+(id, version) 为主键只增不改；证明结果以 (touch_id, touch_version, music_id,
+music_version, coverage_id, coverage_version) 为主键缓存，编译结果以
+(composition_id, composition_version, request_hash) 为主键缓存，multipart
+枚举结果以 (analysis_id, analysis_version, request_hash) 为主键缓存，保证
+同一版本重复证明/编译/枚举结果一致。touch_music / touch_coverage 分别记录
+touch 版本首次引用某评分/覆盖方案时冻结的版本。
 """
 from __future__ import annotations
 
@@ -160,6 +161,27 @@ CREATE TABLE IF NOT EXISTS compilations (
     created_at TEXT NOT NULL,
     PRIMARY KEY (composition_id, composition_version, request_hash)
 );
+CREATE TABLE IF NOT EXISTS multipart_analyses (
+    id TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    touch_id TEXT NOT NULL,
+    touch_version INTEGER NOT NULL,
+    stage INTEGER NOT NULL,
+    spec_json TEXT NOT NULL,
+    result_json TEXT NOT NULL,
+    input_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (id, version)
+);
+CREATE TABLE IF NOT EXISTS multipart_enumerations (
+    analysis_id TEXT NOT NULL,
+    analysis_version INTEGER NOT NULL,
+    request_hash TEXT NOT NULL,
+    input_hash TEXT NOT NULL,
+    result_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (analysis_id, analysis_version, request_hash)
+);
 """
 
 
@@ -273,6 +295,13 @@ class Storage:
                 (touch_id, version),
             ).fetchone()
         return dict(row) if row else None
+
+    def latest_touch_version(self, touch_id: str) -> int | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT MAX(version) AS v FROM touches WHERE id = ?", (touch_id,)
+            ).fetchone()
+        return row["v"]
 
     def list_touches(self) -> list[dict]:
         with self._lock:
@@ -703,6 +732,82 @@ class Storage:
                 " created_at FROM compositions ORDER BY id, version"
             ).fetchall()
         return [dict(r) for r in rows]
+
+    # ---------------- multipart composition 校核 ----------------
+    def next_multipart_version(self, analysis_id: str) -> int:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT MAX(version) AS v FROM multipart_analyses WHERE id = ?",
+                (analysis_id,),
+            ).fetchone()
+            return (row["v"] or 0) + 1
+
+    def insert_multipart(self, rec: dict) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO multipart_analyses"
+                " (id, version, touch_id, touch_version, stage,"
+                " spec_json, result_json, input_hash, created_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?)",
+                (
+                    rec["id"],
+                    rec["version"],
+                    rec["touch_id"],
+                    rec["touch_version"],
+                    rec["stage"],
+                    rec["spec_json"],
+                    rec["result_json"],
+                    rec["input_hash"],
+                    rec["created_at"],
+                ),
+            )
+            self._conn.commit()
+
+    def get_multipart(self, analysis_id: str, version: int) -> dict | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM multipart_analyses WHERE id = ? AND version = ?",
+                (analysis_id, version),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def list_multiparts(self) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, version, touch_id, touch_version, stage, input_hash,"
+                " created_at FROM multipart_analyses ORDER BY id, version"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ---------------- multipart 枚举缓存 ----------------
+    def get_multipart_enumeration(
+        self, analysis_id: str, analysis_version: int, request_hash: str
+    ) -> dict | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM multipart_enumerations"
+                " WHERE analysis_id = ? AND analysis_version = ? AND request_hash = ?",
+                (analysis_id, analysis_version, request_hash),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def insert_multipart_enumeration(self, rec: dict) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO multipart_enumerations"
+                " (analysis_id, analysis_version, request_hash, input_hash,"
+                " result_json, created_at)"
+                " VALUES (?,?,?,?,?,?)",
+                (
+                    rec["analysis_id"],
+                    rec["analysis_version"],
+                    rec["request_hash"],
+                    rec["input_hash"],
+                    rec["result_json"],
+                    rec["created_at"],
+                ),
+            )
+            self._conn.commit()
 
     # ---------------- 编译结果 ----------------
     def get_compilation(

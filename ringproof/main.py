@@ -28,6 +28,12 @@ from .engine import (
     transition_ok,
 )
 from .feasibility import joint_assignment_feasible, quota_feasible
+from .multipart import (
+    MAX_COMPOSITION_CHANGES,
+    MultipartError,
+    analyze_segment,
+    enumerate_segments,
+)
 from .music import score_rows, validate_rules
 from .notation import (
     NotationError,
@@ -46,6 +52,8 @@ from .schemas import (
     EnumerateRequest,
     MethodCreate,
     MethodRef,
+    MultipartAnalysisCreate,
+    MultipartEnumerateRequest,
     MusicSchemeCreate,
     PositionSchemeCreate,
     PrefixCreate,
@@ -87,6 +95,10 @@ def create_app(db_path: str | None = None) -> FastAPI:
             status_code=422,
             content={"detail": {"code": exc.code, "message": exc.message}, **exc.details},
         )
+
+    @app.exception_handler(MultipartError)
+    async def multipart_error_handler(_: Request, exc: MultipartError):
+        return JSONResponse(status_code=422, content={"detail": {"code": exc.code, "message": exc.message}})
 
     # ---------- 方法 ----------
     @app.post("/methods", status_code=201)
@@ -1445,6 +1457,276 @@ def create_app(db_path: str | None = None) -> FastAPI:
             "input_hash": rec["input_hash"],
             "created_at": rec["created_at"],
         }
+
+    # ---------- multipart composition 校核 ----------
+    @app.post("/multipart-analyses", status_code=201)
+    def create_multipart_analysis(body: MultipartAnalysisCreate):
+        """创建 multipart 校核的不可变版本：从不可变 touch 选取首尾落在
+        lead end 的连续区段作为 part，求区段置换并反复作用展开整首
+        composition，校核 part end、循环、提前回归、闭合与重复。
+        touch 版本在此冻结（留空则取最新）。"""
+        tv = body.touch.version or storage.latest_touch_version(body.touch.id)
+        touch_rec = storage.get_touch(body.touch.id, tv) if tv else None
+        if not touch_rec:
+            detail = (
+                f"touch 不存在: {body.touch.id}"
+                if body.touch.version is None
+                else f"touch 版本不存在: {body.touch.id} v{body.touch.version}"
+            )
+            return JSONResponse(status_code=404, content={"detail": detail})
+        ctx = _context_from_record(touch_rec)
+        leads = _resolve_leads(ctx)  # 含 choice 槽位时抛 422
+        stage = ctx["stage"]
+        result = prove_rows(
+            stage,
+            ctx["method"]["name"],
+            leads,
+            ctx["start_row"],
+            ctx["max_calls"],
+            ctx["quotas"],
+            ctx["allowed"],
+            ctx["forbidden"],
+        )
+        rows = [ctx["start_row"]] + [
+            parse_row(ev["row"], stage) for ev in result["events"]
+        ]
+        lead_end_indices = _lead_end_changes(leads)
+        total_changes = result["total_changes"]
+
+        # 区段校验：范围、首尾落在 lead end（起始 change 0 为 touch 起始 row）
+        if body.part_end_change > total_changes:
+            raise MultipartError(
+                "CHANGE_OUT_OF_RANGE",
+                f"part_end_change {body.part_end_change} 超出 touch 范围（1..{total_changes}）",
+            )
+        lead_ends = set(lead_end_indices)
+        if body.part_start_change != 0 and body.part_start_change not in lead_ends:
+            raise MultipartError(
+                "NOT_LEAD_END",
+                f"part_start_change {body.part_start_change} 不是 lead end"
+                f"（lead end 为 {lead_end_indices}，0 为 touch 起始 row）",
+            )
+        if body.part_end_change not in lead_ends:
+            raise MultipartError(
+                "NOT_LEAD_END",
+                f"part_end_change {body.part_end_change} 不是 lead end"
+                f"（lead end 为 {lead_end_indices}）",
+            )
+        for b in body.fixed_bells:
+            if not 1 <= b <= stage:
+                raise MultipartError(
+                    "BELL_OUT_OF_RANGE",
+                    f"必须保持原位的钟 {b} 超出 1..{stage} 范围",
+                )
+        seg_changes = body.part_end_change - body.part_start_change
+        if body.expected_parts * seg_changes > MAX_COMPOSITION_CHANGES:
+            raise MultipartError(
+                "TOO_MANY_CHANGES",
+                f"展开后共 {body.expected_parts * seg_changes} 个 change，"
+                f"超过上限 {MAX_COMPOSITION_CHANGES}",
+            )
+
+        analysis = analyze_segment(
+            stage=stage,
+            rows=rows,
+            events=result["events"],
+            lead_end_indices=lead_end_indices,
+            start_change=body.part_start_change,
+            end_change=body.part_end_change,
+            expected_parts=body.expected_parts,
+            fixed_bells=body.fixed_bells,
+        )
+        analysis_id = body.id or _new_id()
+        version = storage.next_multipart_version(analysis_id)
+        input_hash = canonical_hash(
+            {
+                "touch": {
+                    "id": touch_rec["id"],
+                    "version": touch_rec["version"],
+                    "hash": touch_rec["input_hash"],
+                },
+                "part_start_change": body.part_start_change,
+                "part_end_change": body.part_end_change,
+                "expected_parts": body.expected_parts,
+                "fixed_bells": sorted(body.fixed_bells),
+                "ringproof_version": __version__,
+            }
+        )
+        spec = {
+            "touch": {"id": touch_rec["id"], "version": touch_rec["version"]},
+            "part_start_change": body.part_start_change,
+            "part_end_change": body.part_end_change,
+            "expected_parts": body.expected_parts,
+            "fixed_bells": sorted(body.fixed_bells),
+        }
+        payload = {
+            "id": analysis_id,
+            "version": version,
+            "touch": {
+                "id": touch_rec["id"],
+                "version": touch_rec["version"],
+                "input_hash": touch_rec["input_hash"],
+            },
+            "stage": stage,
+            **analysis,
+            "dependencies": {
+                "ringproof_version": __version__,
+                "touch": {
+                    "id": touch_rec["id"],
+                    "version": touch_rec["version"],
+                    "input_hash": touch_rec["input_hash"],
+                },
+                "methods": [
+                    {"id": m["id"], "version": m["version"], "input_hash": m["input_hash"]}
+                    for m in ctx["methods"]
+                ],
+                "calls": {
+                    k: {"notation": c["notation"], "replace": c["replace"]}
+                    for k, c in sorted(ctx["call_defs"].items())
+                },
+            },
+            "input_hash": input_hash,
+            "created_at": utcnow(),
+        }
+        rec = {
+            "id": analysis_id,
+            "version": version,
+            "touch_id": touch_rec["id"],
+            "touch_version": touch_rec["version"],
+            "stage": stage,
+            "spec_json": json.dumps(spec, ensure_ascii=False, sort_keys=True),
+            "result_json": json.dumps(payload, ensure_ascii=False),
+            "input_hash": input_hash,
+            "created_at": payload["created_at"],
+        }
+        try:
+            storage.insert_multipart(rec)
+        except sqlite3.IntegrityError:
+            return JSONResponse(status_code=409, content={"detail": "该 (id, version) 已存在，版本不可变"})
+        return JSONResponse(payload, status_code=201)
+
+    @app.get("/multipart-analyses")
+    def list_multipart_analyses():
+        return {"multipart_analyses": storage.list_multiparts()}
+
+    @app.get("/multipart-analyses/{analysis_id}")
+    def list_multipart_versions(analysis_id: str):
+        versions = [m for m in storage.list_multiparts() if m["id"] == analysis_id]
+        if not versions:
+            return JSONResponse(status_code=404, content={"detail": f"multipart 分析不存在: {analysis_id}"})
+        return {"id": analysis_id, "versions": versions}
+
+    @app.get("/multipart-analyses/{analysis_id}/versions/{version}")
+    def get_multipart_analysis(analysis_id: str, version: int):
+        rec = storage.get_multipart(analysis_id, version)
+        if not rec:
+            return JSONResponse(status_code=404, content={"detail": f"multipart 分析版本不存在: {analysis_id} v{version}"})
+        return json.loads(rec["result_json"])
+
+    @app.post("/multipart-analyses/{analysis_id}/versions/{version}/enumerate")
+    def enumerate_multipart(analysis_id: str, version: int, body: MultipartEnumerateRequest):
+        """在分析冻结的 touch 中枚举整首为真的 multipart composition：
+        候选为全部首尾落在 lead end 的连续区段，先按 fixed bells 与轨道
+        长度剪枝，再做行交集扫描，只保留整首为真的结果，沿用 touch 中的
+        位置顺序。相同请求重复枚举结果一致（按请求内容哈希缓存）。"""
+        rec = storage.get_multipart(analysis_id, version)
+        if not rec:
+            return JSONResponse(status_code=404, content={"detail": f"multipart 分析版本不存在: {analysis_id} v{version}"})
+        spec = json.loads(rec["spec_json"])
+        touch_rec = storage.get_touch(spec["touch"]["id"], spec["touch"]["version"])
+        if not touch_rec:
+            return JSONResponse(
+                status_code=422,
+                content={"detail": {"code": "TOUCH_MISSING",
+                                    "message": f"分析引用的 touch 版本缺失: {spec['touch']['id']} "
+                                               f"v{spec['touch']['version']}"}},
+            )
+        request_key = {
+            "analysis_hash": rec["input_hash"],
+            "parts": body.parts,
+            "min_parts": body.min_parts,
+            "max_parts": body.max_parts,
+            "max_results": body.max_results,
+            "max_search": body.max_search,
+            "ringproof_version": __version__,
+        }
+        request_hash = canonical_hash(request_key)
+        cached = storage.get_multipart_enumeration(analysis_id, version, request_hash)
+        if cached and cached["input_hash"] == rec["input_hash"]:
+            return JSONResponse(
+                json.loads(cached["result_json"]), headers={"X-Multipart-Cache": "hit"}
+            )
+
+        ctx = _context_from_record(touch_rec)
+        leads = _resolve_leads(ctx)
+        stage = ctx["stage"]
+        result = prove_rows(
+            stage,
+            ctx["method"]["name"],
+            leads,
+            ctx["start_row"],
+            ctx["max_calls"],
+            ctx["quotas"],
+            ctx["allowed"],
+            ctx["forbidden"],
+        )
+        rows = [ctx["start_row"]] + [
+            parse_row(ev["row"], stage) for ev in result["events"]
+        ]
+        lead_end_indices = _lead_end_changes(leads)
+        search = enumerate_segments(
+            stage=stage,
+            rows=rows,
+            lead_end_indices=lead_end_indices,
+            fixed_bells=spec["fixed_bells"],
+            min_parts=body.min_parts,
+            max_parts=body.max_parts,
+            max_results=body.max_results,
+            max_search=body.max_search,
+        )
+        payload = {
+            "analysis_id": analysis_id,
+            "analysis_version": version,
+            "input_hash": rec["input_hash"],
+            "request_hash": request_hash,
+            "touch": {
+                "id": touch_rec["id"],
+                "version": touch_rec["version"],
+                "input_hash": touch_rec["input_hash"],
+            },
+            "stage": stage,
+            "fixed_bells": spec["fixed_bells"],
+            "parts_range": [body.min_parts, body.max_parts],
+            "sorted_by": ["start_change", "end_change"],
+            "dependencies": {
+                "ringproof_version": __version__,
+                "touch": {
+                    "id": touch_rec["id"],
+                    "version": touch_rec["version"],
+                    "input_hash": touch_rec["input_hash"],
+                },
+                "methods": [
+                    {"id": m["id"], "version": m["version"], "input_hash": m["input_hash"]}
+                    for m in ctx["methods"]
+                ],
+                "calls": {
+                    k: {"notation": c["notation"], "replace": c["replace"]}
+                    for k, c in sorted(ctx["call_defs"].items())
+                },
+            },
+            **search,
+        }
+        storage.insert_multipart_enumeration(
+            {
+                "analysis_id": analysis_id,
+                "analysis_version": version,
+                "request_hash": request_hash,
+                "input_hash": rec["input_hash"],
+                "result_json": json.dumps(payload, ensure_ascii=False),
+                "created_at": utcnow(),
+            }
+        )
+        return JSONResponse(payload, headers={"X-Multipart-Cache": "miss"})
 
     # ---------- 部分 touch：前缀校核 ----------
     @app.post("/prefixes", status_code=201)

@@ -30,6 +30,16 @@ method、call），枚举时可设最低总分或规则命中数门槛过滤并�
 结果。位置方案、composition 与生成 touch 的依赖版本冻结，相同输入重复
 编译结果一致。
 
+支持**multipart composition 校核**：调用方从不可变 touch 选取首尾落在
+lead end 的连续区段作为一个 part，设置预期 part 数与必须保持原位的钟；
+系统求出区段起止 row 间的钟置换并反复作用，各 part 无须重复提交 row——
+按置换展开整首 composition，返回各 part end、置换循环与提前回到起点的
+位置，轨道不能按预期闭合时指出不一致的钟位；同时检查 part 内及跨 part
+重复，冲突给出 row 与双方的 part、change、method、call 来源。枚举接口
+在 touch 的全部 lead-end 区段中搜索整首为真的方案，可限定 part 数，
+先按轨道长度与行交集剪枝再沿用 touch 位置顺序；分析版本冻结 touch、
+方法与 call 依赖，相同输入重复计算保持一致。
+
 ## 运行
 
 ```bash
@@ -82,6 +92,9 @@ python3 -m uvicorn ringproof.main:app --port 8765
 | POST | `/compositions` | 创建呼叫位置 composition 版本（可复用 part、逐 token 位置符号+call+plain lead 限额） |
 | GET | `/compositions/{id}/versions/{v}` | 规范化 part/token、冻结的位置方案与方法版本、plain course 长度 |
 | POST | `/compositions/{id}/versions/{v}/compile` | 编译为 touch：逐 lead 位置推演+证明，成功另存 touch 版本（按请求内容哈希缓存，`X-Compile-Cache`） |
+| POST | `/multipart-analyses` | 创建 multipart 校核版本（touch 区段 + 预期 part 数 + 保持原位的钟；冻结 touch/方法/call 依赖） |
+| GET | `/multipart-analyses/{id}/versions/{v}` | 各 part end、置换循环、提前回归位置、闭合与不一致钟位、重复冲突来源 |
+| POST | `/multipart-analyses/{id}/versions/{v}/enumerate` | 枚举整首为真的区段（part 数限定、轨道/行交集剪枝、原排序；按请求哈希缓存，`X-Multipart-Cache`） |
 
 ### 证明结果字段
 
@@ -425,6 +438,69 @@ call lead，取 call 结束后观察钟位置唯一命中符号的候选。每�
 position、前后 lead head 与观察钟标注（`generated_by`、`compiled_tokens`、
 `course_heads` 一并读回）。
 
+## multipart composition 校核
+
+multipart composition 把同一个区段（part）反复敲响：第 k 段的逐 row 是
+第一段对应 row 经**钟置换** φ 改名后的像（change 作用于位置、φ 作用于
+钟，两者可交换）。因此调用方只需提交一个 part，系统按置换展开整首
+composition，各 part 无须重复提交 row。
+
+### 1. 创建分析（不可变版本，冻结 touch/方法/call 依赖）
+
+```json
+POST /multipart-analyses
+{
+  "id": "mp",
+  "touch": {"id": "pc"},
+  "part_start_change": 0,
+  "part_end_change": 12,
+  "expected_parts": 5,
+  "fixed_bells": [1]
+}
+```
+
+- `touch` 引用不可变 touch（`version` 留空则冻结为创建时最新版本）；
+- `part_start_change` / `part_end_change` 为区段起止 change 序号，须落在
+  lead end（起始 change `0` 表示 touch 起始 row），否则 422 `NOT_LEAD_END`；
+  超出 touch 范围返回 422 `CHANGE_OUT_OF_RANGE`；
+- `expected_parts` 为预期 part 数（置换反复作用的次数）；
+- `fixed_bells` 为必须保持原位的钟：区段置换须将其固定（越界 422
+  `BELL_OUT_OF_RANGE`）；展开规模超限返回 422 `TOO_MANY_CHANGES`。
+
+### 2. 分析结果
+
+- `permutation` — 区段置换：`images`（各钟的像）、`cycles`（循环分解）、
+  `fixed_bells`（被固定的钟）、`order`（阶，即轨道长度）；
+- `part_ends` — 各 part end 排列（是否为起点/rounds）；
+- `early_returns` — 提前回到起点（part end 在预期 part 数之前回到区段首
+  row）的 part 位置；
+- `closes_as_expected` / `inconsistent_bells` — 轨道不能按预期闭合
+  （φ^expected ≠ 恒等）时，逐个指出不一致钟位的像与起止位置；
+- `fixed_bell_checks` / `fixed_bells_satisfied` — 保持原位钟的逐个校核；
+- `truth` / `first_conflict` — 按置换展开整首 composition 后检查 part 内
+  及跨 part 重复；冲突给出 row 与双方来源（`part`、`change_in_part`、整首
+  `change`、对应的 `touch_change`、`lead`、`change_in_lead`、`method`、
+  `call`、`notation`）；末 part 末 row 回到起点属正常闭合，不算重复；
+- `dependencies` — 冻结的 touch、方法、call 与 ringproof 版本；相同输入
+  重复计算保持一致。
+
+### 3. 枚举整首为真的区段
+
+```bash
+curl -X POST localhost:8765/multipart-analyses/mp/versions/1/enumerate \
+  -H 'Content-Type: application/json' \
+  -d '{"parts": 5, "max_results": 50}'
+```
+
+在分析冻结的 touch 中枚举全部首尾落在 lead end 的候选区段（起始 change
+`0` 含在内）：先按 fixed bells（继承自分析）与**轨道长度**剪枝——part 数
+须等于置换的阶才能整首闭合且不重复，`parts` 或 `min_parts`/`max_parts`
+限定范围——再做**行交集**扫描（计数 `pruned_by_fixed_bells` /
+`pruned_by_orbit` / `pruned_by_size` / `pruned_by_rows`），只保留整首为真
+的结果，沿用 touch 中的位置顺序（`start_change`、`end_change`）返回。
+`max_results` / `max_search` 超出时截断并给出 `truncation_reason`；相同
+请求重复枚举命中缓存（`X-Multipart-Cache: hit`），结果一致。
+
 ## 示例
 
 ```bash
@@ -516,10 +592,24 @@ curl -X POST localhost:8765/prefixes/pfx/versions/1/continuation \
 curl -X POST localhost:8765/prefixes -H 'Content-Type: application/json' -d \
   '{"from_touch":{"touch_id":"pc","touch_version":1,"up_to_change":10}}'
 # → partial_lead 给出 consumed=10/lead_length=12，续接时先强制敲完剩余 2 个 change
+
+# 12. multipart 校核：取 plain course 的第一个 lead（change 0..12）作为 part，
+#     预期 5 个 part、钟 1 保持原位
+curl -X POST localhost:8765/multipart-analyses -H 'Content-Type: application/json' -d \
+  '{"id":"mp","touch":{"id":"pc"},"part_start_change":0,"part_end_change":12,
+    "expected_parts":5,"fixed_bells":[1]}'
+# → permutation.cycles=[[2,3,5,6,4]]、order=5；part_ends 依次为
+#   135264/156342/164523/142635/123456；closes_as_expected=true、truth="true"
+
+# 13. 枚举整首为真的 multipart 区段（限定 5 个 part）
+curl -X POST localhost:8765/multipart-analyses/mp/versions/1/enumerate \
+  -H 'Content-Type: application/json' -d '{"parts":5}'
+# → 5 个结果（每个 1-lead 区段、parts=5），pruned_by_orbit/pruned_by_rows
+#   给出剪枝计数；重复请求命中缓存（X-Multipart-Cache: hit）
 ```
 
 ## 测试
 
 ```bash
-python3 -m pytest tests/ -q   # 166 个用例
+python3 -m pytest tests/ -q   # 183 个用例
 ```
