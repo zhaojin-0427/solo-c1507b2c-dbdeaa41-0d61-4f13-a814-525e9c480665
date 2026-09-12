@@ -711,3 +711,47 @@ class BlockSearchRequest(BaseModel):
         default=20000, ge=1, le=2_000_000,
         description="搜索预算：最多访问的状态数，超出则截断并说明原因",
     )
+
+
+# ---------------- 方法相假图谱 ----------------
+
+
+class FalsenessAnalysisCreate(BaseModel):
+    """创建方法相假图谱的不可变版本。
+
+    选择 1～8 个同钟数方法（版本留空则冻结为最新）与参考 course head，
+    指定 2～6 口可变钟：其余钟位固定，枚举可变钟的全部排列（不超过 720
+    个）作为 course head 集合，每个 (方法, course head) 组合独立展开
+    plain course（上限 ``max_leads`` 个 lead）。重复的可变钟在此被拒绝；
+    跨钟数引用、越界可变钟与超限未闭合的 course 由服务端拒绝（不落库）。
+    """
+
+    id: str | None = Field(default=None, description="留空则自动生成；同名 id 递增版本")
+    name: str | None = Field(default=None, max_length=200)
+    methods: list[MethodRef] = Field(
+        min_length=1, max_length=8,
+        description="同钟数方法列表（1~8 个，id 须唯一；版本留空则冻结为最新）",
+    )
+    course_head: str | None = Field(
+        default=None, description="参考 course head 排列（1..stage 的完整排列），缺省为 rounds"
+    )
+    mutable_bells: list[int] = Field(
+        min_length=2, max_length=6, description="可变钟钟号列表（2~6 口，须唯一，1..stage）"
+    )
+    max_leads: int = Field(
+        default=200, ge=1, le=1000,
+        description="单个 plain course 的 lead 上限；达到上限仍未闭合则拒绝创建",
+    )
+    max_course_heads: int = Field(
+        default=720, ge=1, le=720,
+        description="枚举 course head 数上限（可变钟排列超出时截断并在结果中标注）",
+    )
+
+    @model_validator(mode="after")
+    def _check(self) -> "FalsenessAnalysisCreate":
+        ids = [m.id for m in self.methods]
+        if len(set(ids)) != len(ids):
+            raise ValueError("methods 列表存在重复的方法 id")
+        if len(set(self.mutable_bells)) != len(self.mutable_bells):
+            raise ValueError("mutable_bells 存在重复钟号")
+        return self

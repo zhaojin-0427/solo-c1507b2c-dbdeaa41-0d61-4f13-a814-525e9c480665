@@ -50,6 +50,15 @@ lead head 展开，钟数不一致、边界非法或区段自身为假时拒绝�
 block 数与 call 数排序；结果冻结 touch、方法与 call 依赖，相同请求重复
 计算保持一致。
 
+支持**方法相假图谱**：以 course head 为独立分析对象，调用方选择 1～8 个
+同钟数方法的不可变版本与参考 course head，指定 2～6 口可变钟；系统固定
+其余钟位，枚举可变钟的全部排列（不超过 720 个 course head），每个
+（方法, course head）组合独立展开 plain course（上限 1000 个 lead，
+超限未闭合拒绝创建）。结果列出各 course 的闭合长度与内部真值，以矩阵
+汇总组合间的共享 row 数，首次冲突追溯双方的 method、course head、lead
+与 change，并按共享 row 关系生成连通分组；可筛选内部为真且彼此无共享
+row 的组合。分析版本写入 SQLite，重复查询保持一致。
+
 ## 运行
 
 ```bash
@@ -108,6 +117,8 @@ python3 -m uvicorn ringproof.main:app --port 8765
 | POST | `/block-compositions` | 创建 block 拼装版本（多 touch 的 lead-end 区段 + 使用次数 + 衔接规则 + 总 change 数与目标末行；冻结 touch/方法/call 依赖） |
 | GET | `/block-compositions/{id}/versions/{v}` | 各 block 的相对置换、区段与用量、冻结依赖与输入哈希 |
 | POST | `/block-compositions/{id}/versions/{v}/search` | 搜索满足用量/衔接/长度/末行的 block 组合（可达性/剩余长度/行交集剪枝、冲突两侧来源；按请求哈希缓存，`X-Block-Search-Cache`） |
+| POST | `/falseness-analyses` | 创建方法相假图谱版本（同钟数方法 + 参考 course head + 2~6 口可变钟；枚举 ≤720 个 course head 展开 plain course；冻结方法版本） |
+| GET | `/falseness-analyses/{id}/versions/{v}` | 各 course 闭合长度与内部真值、共享 row 矩阵、首次冲突、连通分组、截断状态与检查数量；`only_true_disjoint=true` 筛选为真且互不相交的组合 |
 
 ### 证明结果字段
 
@@ -584,6 +595,56 @@ curl -X POST localhost:8765/block-compositions/bc/versions/1/search \
 - `max_search` 超出时截断并给出 `truncation_reason`；相同请求重复搜索
   命中缓存（`X-Block-Search-Cache: hit`），结果一致。
 
+## 方法相假图谱
+
+评估一组方法在同一批 course head 下的相假（falseness）关系：每个
+（方法, course head）组合独立展开 plain course，组合间按共享 row 计数，
+帮助作曲者判断哪些方法在哪些 course 中互相冲突。
+
+### 1. 创建分析（不可变版本，冻结方法版本）
+
+```json
+POST /falseness-analyses
+{
+  "id": "fa",
+  "methods": [{"id": "pb-minor"}, {"id": "cambridge-minor"}],
+  "course_head": "123456",
+  "mutable_bells": [5, 6],
+  "max_leads": 200,
+  "max_course_heads": 720
+}
+```
+
+- `methods` 为 1～8 个**同钟数**方法（`version` 留空则冻结为创建时最新）；
+- `course_head` 为参考排列（缺省 rounds）；`mutable_bells` 指定 2～6 口
+  可变钟，其余钟位固定，枚举可变钟在参考排列所占位置上的全部排列作为
+  course head 集合（第一个为参考排列本身）；
+- `max_course_heads`（≤720）截断枚举数量，截断时 `truncated: true` 并
+  给出 `truncation_reason`；`max_leads`（≤1000）为单个 plain course 的
+  lead 上限；
+- 创建时拒绝（不落库）：重复可变钟或方法 id（422）、`STAGE_MISMATCH`
+  （跨钟数引用）、`BELL_OUT_OF_RANGE`（可变钟越界）、非法排列
+  （`ROW_NOT_PERMUTATION` 等）、方法版本缺失（404）、`COURSE_NOT_CLOSED`
+  （某 course 达到 lead 上限仍未闭合，消息指明方法与 course head）。
+
+### 2. 分析结果
+
+- `courses` — 各组合的 `leads`（闭合 lead 数）、`changes`、`truth`
+  （内部真值；终点回到 course head 属正常闭合）、`first_repeat`（内部
+  首次重复的双方 lead/change）、`shared_with`（与之共享 row 的组合数）；
+- `matrix` — 组合间共享 row 数的稀疏矩阵（`entries` 只列共享数 > 0 的
+  组合对）；
+- `first_conflict` — 按组合序的首对共享：共享 row、双方 method、
+  course head、lead 与 change；
+- `groups` — 按共享 row 关系求出的连通分组（无共享的组合自成一组）；
+- `checks` — 检查数量（course 数、组合对数、共享对数、去重 row 数）；
+- `truncated` / `truncation_reason`、`input_hash`、`dependencies`。
+
+`GET /falseness-analyses/{id}/versions/{v}?only_true_disjoint=true` 时
+`courses` 只保留**内部为真且与其余任何组合均无共享 row** 的组合（返回
+`filter` / `total_courses` / `returned_courses`，matrix/groups 仍为完整
+分析）。分析版本写入 SQLite，同一版本重复查询结果一致。
+
 ## 示例
 
 ```bash
@@ -694,5 +755,5 @@ curl -X POST localhost:8765/multipart-analyses/mp/versions/1/enumerate \
 ## 测试
 
 ```bash
-python3 -m pytest tests/ -q   # 209 个用例
+python3 -m pytest tests/ -q   # 234 个用例
 ```

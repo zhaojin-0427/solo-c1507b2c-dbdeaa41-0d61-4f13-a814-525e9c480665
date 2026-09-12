@@ -7,7 +7,9 @@
 可复用 block 拼装：从多个不可变 touch 截取 lead-end 区段作为 block
 （转为相对起点的位置置换，可从不同 lead head 展开），设置使用次数与相邻
 衔接规则、限定总 change 数与目标末行，搜索满足约束且无跨 block 重复的
-组合。
+组合。方法相假图谱：以 course head 为独立分析对象，接入不可变方法版本，
+枚举可变钟排列（≤720 个 course head）并展开 plain course，按共享 row
+关系汇总相假矩阵、首次冲突与连通分组，分析版本写入 SQLite。
 """
 from __future__ import annotations
 
@@ -32,6 +34,7 @@ from .engine import (
     prove_rows,
     transition_ok,
 )
+from .falseness import FalsenessError, analyze_falseness, enumerate_course_heads
 from .feasibility import joint_assignment_feasible, quota_feasible
 from .multipart import (
     MAX_COMPOSITION_CHANGES,
@@ -57,6 +60,7 @@ from .schemas import (
     ContinueRequest,
     CoverageSchemeCreate,
     EnumerateRequest,
+    FalsenessAnalysisCreate,
     MethodCreate,
     MethodRef,
     MultipartAnalysisCreate,
@@ -109,6 +113,10 @@ def create_app(db_path: str | None = None) -> FastAPI:
 
     @app.exception_handler(BlockError)
     async def block_error_handler(_: Request, exc: BlockError):
+        return JSONResponse(status_code=422, content={"detail": {"code": exc.code, "message": exc.message}})
+
+    @app.exception_handler(FalsenessError)
+    async def falseness_error_handler(_: Request, exc: FalsenessError):
         return JSONResponse(status_code=422, content={"detail": {"code": exc.code, "message": exc.message}})
 
     # ---------- 方法 ----------
@@ -2014,6 +2022,176 @@ def create_app(db_path: str | None = None) -> FastAPI:
             }
         )
         return JSONResponse(payload, headers={"X-Block-Search-Cache": "miss"})
+
+    # ---------- 方法相假图谱 ----------
+    @app.post("/falseness-analyses", status_code=201)
+    def create_falseness_analysis(body: FalsenessAnalysisCreate):
+        """创建方法相假图谱的不可变版本：以 course head 为独立分析对象，
+        接入不可变方法版本（留空则冻结为最新）；固定非可变钟位，枚举可变钟
+        排列（不超过 720 个 course head）并逐组合展开 plain course。
+        可变钟重复或跨钟数引用在此被拒绝；任何 course 达到 lead 上限仍未
+        闭合同样拒绝（不落库）。"""
+        methods: list[dict] = []
+        for ref in body.methods:
+            mv = ref.version or storage.latest_method_version(ref.id)
+            method = storage.get_method(ref.id, mv) if mv else None
+            if not method:
+                detail = (
+                    f"方法不存在: {ref.id}"
+                    if ref.version is None
+                    else f"方法版本不存在: {ref.id} v{ref.version}"
+                )
+                return JSONResponse(status_code=404, content={"detail": detail})
+            methods.append(method)
+        stage = methods[0]["stage"]
+        for m in methods[1:]:
+            if m["stage"] != stage:
+                return JSONResponse(
+                    status_code=422,
+                    content={"detail": {"code": "STAGE_MISMATCH",
+                                        "message": f"方法 {m['id']!r} 为 {m['stage']} 口钟，"
+                                                   f"与 {methods[0]['id']!r} 的 {stage} 口不一致"}},
+                )
+        reference = (
+            parse_row(body.course_head, stage)
+            if body.course_head
+            else tuple(range(1, stage + 1))
+        )
+        for b in body.mutable_bells:
+            if not 1 <= b <= stage:
+                return JSONResponse(
+                    status_code=422,
+                    content={"detail": {"code": "BELL_OUT_OF_RANGE",
+                                        "message": f"可变钟 {b} 超出 1..{stage} 范围"}},
+                )
+        course_heads, total_heads = enumerate_course_heads(
+            reference, body.mutable_bells, body.max_course_heads
+        )
+        truncated = total_heads > len(course_heads)
+        method_ctxs = []
+        for m in methods:
+            ch = json.loads(m["changes_json"])
+            method_ctxs.append(
+                {
+                    "id": m["id"],
+                    "version": m["version"],
+                    "name": m["name"],
+                    "changes": [frozenset(p) for p in ch["places"]],
+                }
+            )
+        analysis = analyze_falseness(method_ctxs, course_heads, body.max_leads)
+
+        analysis_id = body.id or _new_id()
+        version = storage.next_falseness_version(analysis_id)
+        truncation_reason = (
+            f"可变钟排列共 {total_heads} 个，超过 max_course_heads="
+            f"{body.max_course_heads}，仅枚举前 {len(course_heads)} 个 course head"
+            if truncated
+            else None
+        )
+        spec = {
+            "name": body.name,
+            "stage": stage,
+            "methods": [{"id": m["id"], "version": m["version"]} for m in methods],
+            "course_head": row_to_string(reference),
+            "mutable_bells": sorted(body.mutable_bells),
+            "max_leads": body.max_leads,
+            "max_course_heads": body.max_course_heads,
+        }
+        input_hash = canonical_hash(
+            {
+                **spec,
+                "methods": [
+                    {"id": m["id"], "version": m["version"], "hash": m["input_hash"]}
+                    for m in methods
+                ],
+                "ringproof_version": __version__,
+            }
+        )
+        payload = {
+            "id": analysis_id,
+            "version": version,
+            "name": body.name,
+            "stage": stage,
+            "reference_course_head": row_to_string(reference),
+            "mutable_bells": sorted(body.mutable_bells),
+            "fixed_bells": [
+                b for b in range(1, stage + 1) if b not in set(body.mutable_bells)
+            ],
+            "methods": _method_summaries(methods),
+            "course_heads": [row_to_string(h) for h in course_heads],
+            "total_course_heads": total_heads,
+            "max_leads": body.max_leads,
+            "max_course_heads": body.max_course_heads,
+            **analysis,
+            "truncated": truncated,
+            "truncation_reason": truncation_reason,
+            "dependencies": {
+                "ringproof_version": __version__,
+                "methods": [
+                    {"id": m["id"], "version": m["version"], "input_hash": m["input_hash"]}
+                    for m in methods
+                ],
+            },
+            "input_hash": input_hash,
+            "created_at": utcnow(),
+        }
+        rec = {
+            "id": analysis_id,
+            "version": version,
+            "stage": stage,
+            "spec_json": json.dumps(spec, ensure_ascii=False, sort_keys=True),
+            "result_json": json.dumps(payload, ensure_ascii=False),
+            "input_hash": input_hash,
+            "created_at": payload["created_at"],
+        }
+        try:
+            storage.insert_falseness(rec)
+        except sqlite3.IntegrityError:
+            return JSONResponse(status_code=409, content={"detail": "该 (id, version) 已存在，版本不可变"})
+        return JSONResponse(payload, status_code=201)
+
+    @app.get("/falseness-analyses")
+    def list_falseness_analyses():
+        return {"falseness_analyses": storage.list_falseness()}
+
+    @app.get("/falseness-analyses/{analysis_id}")
+    def list_falseness_versions(analysis_id: str):
+        versions = [f for f in storage.list_falseness() if f["id"] == analysis_id]
+        if not versions:
+            return JSONResponse(status_code=404, content={"detail": f"相假分析不存在: {analysis_id}"})
+        return {"id": analysis_id, "versions": versions}
+
+    @app.get("/falseness-analyses/{analysis_id}/versions/{version}")
+    def get_falseness_analysis(
+        analysis_id: str,
+        version: int,
+        only_true_disjoint: bool = Query(False),
+    ):
+        """读取相假分析版本（含各 course 闭合长度与内部真值、相假矩阵、
+        首次冲突、连通分组、截断状态、检查数量与输入哈希）。
+        only_true_disjoint=true 时 courses 只保留内部为真且与其余任何组合
+        均无共享 row 的组合（matrix/groups 仍为完整分析）；同一版本重复
+        查询结果一致。"""
+        rec = storage.get_falseness(analysis_id, version)
+        if not rec:
+            return JSONResponse(status_code=404, content={"detail": f"相假分析版本不存在: {analysis_id} v{version}"})
+        payload = json.loads(rec["result_json"])
+        if only_true_disjoint:
+            all_courses = payload["courses"]
+            kept = [
+                c
+                for c in all_courses
+                if c["truth"] == "true" and c["shared_with"] == 0
+            ]
+            payload = {
+                **payload,
+                "courses": kept,
+                "filter": "true_disjoint",
+                "total_courses": len(all_courses),
+                "returned_courses": len(kept),
+            }
+        return payload
 
     # ---------- 部分 touch：前缀校核 ----------
     @app.post("/prefixes", status_code=201)
