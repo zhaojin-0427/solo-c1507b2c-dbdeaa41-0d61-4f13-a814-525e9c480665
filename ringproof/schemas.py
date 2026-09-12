@@ -6,6 +6,8 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from .multipart import MAX_COMPOSITION_CHANGES
+
 CALL_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*$")
 RESERVED_CALLS = {"plain"}
 
@@ -624,3 +626,88 @@ class MultipartEnumerateRequest(BaseModel):
         if self.min_parts > self.max_parts:
             raise ValueError("min_parts 不能大于 max_parts")
         return self
+
+
+# ---------------- 可复用 block 拼装 ----------------
+
+
+class BlockSpec(BaseModel):
+    """一个可复用 block：从不可变 touch 截取的 lead-end 区段 + 使用次数。"""
+
+    id: str = Field(
+        min_length=1, max_length=50,
+        description="block 标识（同一 composition 内唯一；衔接规则与搜索结果以此引用）",
+    )
+    touch: TouchRef = Field(description="区段所在的不可变 touch（版本留空则随 composition 冻结为最新）")
+    start_change: int = Field(
+        ge=0, description="区段起始 change 序号（0 为 touch 起始 row；须为 lead end）"
+    )
+    end_change: int = Field(ge=1, description="区段结束 change 序号（须为 lead end）")
+    min_uses: int = Field(default=0, ge=0, le=1000, description="组合中最少使用次数")
+    max_uses: int | None = Field(
+        default=None, ge=1, le=1000,
+        description="组合中最多使用次数；null 表示不限（受总 change 数约束）",
+    )
+
+    @model_validator(mode="after")
+    def _check(self) -> "BlockSpec":
+        if self.start_change >= self.end_change:
+            raise ValueError("start_change 须小于 end_change")
+        if self.max_uses is not None and self.min_uses > self.max_uses:
+            raise ValueError(f"min_uses({self.min_uses}) 不能大于 max_uses({self.max_uses})")
+        return self
+
+
+class BlockCompositionCreate(BaseModel):
+    """创建可复用 block 拼装的不可变版本。
+
+    从多个不可变 touch 截取首尾落在 lead end 的区段作为 block（保存时转为
+    相对起点的钟置换，可从不同 lead head 展开），设置各 block 使用次数与
+    相邻衔接规则，并限定总 change 数与目标末行。钟数不一致、边界非法或
+    区段自身为假时拒绝保存（不落库）。
+    """
+
+    id: str | None = Field(default=None, description="留空则自动生成；同名 id 递增版本")
+    name: str | None = Field(default=None, max_length=200)
+    blocks: list[BlockSpec] = Field(
+        min_length=1, max_length=64, description="可复用 block 列表（可引用多个 touch）"
+    )
+    start_row: str | None = Field(default=None, description="起始排列，缺省为 rounds")
+    target_row: str | None = Field(
+        default=None, description="目标末行；null 表示不限制末行"
+    )
+    min_changes: int = Field(
+        default=0, ge=0, le=MAX_COMPOSITION_CHANGES, description="组合总 change 数下限"
+    )
+    max_changes: int = Field(
+        ge=1, le=MAX_COMPOSITION_CHANGES,
+        description="组合总 change 数上限（搜索规模由此界定）",
+    )
+    allowed_transitions: list[TransitionPair] | None = Field(
+        default=None,
+        description="相邻 block 间允许的衔接白名单 [from, to]；null 表示不限制（同 block 延续始终允许）",
+    )
+    forbidden_transitions: list[TransitionPair] | None = Field(
+        default=None, description="相邻 block 间禁止的衔接 [from, to]"
+    )
+
+    @model_validator(mode="after")
+    def _check(self) -> "BlockCompositionCreate":
+        ids = [b.id for b in self.blocks]
+        if len(set(ids)) != len(ids):
+            raise ValueError("blocks 列表存在重复的 block id")
+        if self.min_changes > self.max_changes:
+            raise ValueError("min_changes 不能大于 max_changes")
+        return self
+
+
+class BlockSearchRequest(BaseModel):
+    """block 组合搜索请求。"""
+
+    max_results: int = Field(
+        default=50, ge=1, le=500, description="最多返回的组合数（按排序取最优）"
+    )
+    max_search: int = Field(
+        default=20000, ge=1, le=2_000_000,
+        description="搜索预算：最多访问的状态数，超出则截断并说明原因",
+    )

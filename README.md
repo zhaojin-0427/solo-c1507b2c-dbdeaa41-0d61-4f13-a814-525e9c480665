@@ -40,6 +40,16 @@ lead end 的连续区段作为一个 part，设置预期 part 数与必须保持
 先按轨道长度与行交集剪枝再沿用 touch 位置顺序；分析版本冻结 touch、
 方法与 call 依赖，相同输入重复计算保持一致。
 
+支持**可复用 block 拼装**：调用方从多个不可变 touch 截取首尾落在
+lead end 的区段作为 block，设置各 block 使用次数与相邻衔接规则，并限定
+总 change 数与目标末行；区段保存时转为相对起点的钟置换，可从不同
+lead head 展开，钟数不一致、边界非法或区段自身为假时拒绝保存。搜索按
+展开后的逐 row 检查跨 block 重复，只返回满足用量、衔接、长度与末行要求
+的组合，冲突列出相同 row 两侧的 block、touch、change、method、call 来源；
+先按端点可达性、剩余长度与行交集剪枝，再按目标达成、总 change 数、
+block 数与 call 数排序；结果冻结 touch、方法与 call 依赖，相同请求重复
+计算保持一致。
+
 ## 运行
 
 ```bash
@@ -95,6 +105,9 @@ python3 -m uvicorn ringproof.main:app --port 8765
 | POST | `/multipart-analyses` | 创建 multipart 校核版本（touch 区段 + 预期 part 数 + 保持原位的钟；冻结 touch/方法/call 依赖） |
 | GET | `/multipart-analyses/{id}/versions/{v}` | 各 part end、置换循环、提前回归位置、闭合与不一致钟位、重复冲突来源 |
 | POST | `/multipart-analyses/{id}/versions/{v}/enumerate` | 枚举整首为真的区段（part 数限定、轨道/行交集剪枝、原排序；按请求哈希缓存，`X-Multipart-Cache`） |
+| POST | `/block-compositions` | 创建 block 拼装版本（多 touch 的 lead-end 区段 + 使用次数 + 衔接规则 + 总 change 数与目标末行；冻结 touch/方法/call 依赖） |
+| GET | `/block-compositions/{id}/versions/{v}` | 各 block 的相对置换、区段与用量、冻结依赖与输入哈希 |
+| POST | `/block-compositions/{id}/versions/{v}/search` | 搜索满足用量/衔接/长度/末行的 block 组合（可达性/剩余长度/行交集剪枝、冲突两侧来源；按请求哈希缓存，`X-Block-Search-Cache`） |
 
 ### 证明结果字段
 
@@ -501,6 +514,73 @@ curl -X POST localhost:8765/multipart-analyses/mp/versions/1/enumerate \
 `max_results` / `max_search` 超出时截断并给出 `truncation_reason`；相同
 请求重复枚举命中缓存（`X-Multipart-Cache: hit`），结果一致。
 
+## 可复用 block 拼装
+
+把多个 touch 的 lead-end 区段当作可复用积木：每个 block 保存时转为
+**相对起点的钟置换** φ（change 作用于位置、φ 作用于钟，两者可交换），
+因此同一 block 可从任意 lead head 展开——从任意 row 出发施加同一串
+change，末 row 恰为该 row 的 φ 像。组合搜索把 block 逐个衔接，检查跨
+block 重复，找出满足全部约束的拼装方案。
+
+### 1. 创建 block composition（不可变版本，冻结 touch/方法/call 依赖）
+
+```json
+POST /block-compositions
+{
+  "id": "bc",
+  "blocks": [
+    {"id": "A", "touch": {"id": "pc"}, "start_change": 0, "end_change": 12,
+     "max_uses": 5},
+    {"id": "B", "touch": {"id": "pc2"}, "start_change": 0, "end_change": 12}
+  ],
+  "target_row": "123456",
+  "min_changes": 0,
+  "max_changes": 60,
+  "forbidden_transitions": [["B", "A"]]
+}
+```
+
+- 每个 block 引用一个不可变 touch（`version` 留空则冻结为创建时最新），
+  `start_change`/`end_change` 须落在 lead end（起始 change `0` 为 touch
+  起始 row），否则 422 `NOT_LEAD_END`；超出 touch 范围返回 422
+  `CHANGE_OUT_OF_RANGE`；`min_uses`/`max_uses` 限定组合中的使用次数
+  （`max_uses` 为 null 表示不限，受总 change 数约束）；
+- 创建时拒绝（不落库）：`STAGE_MISMATCH`（各 touch 钟数不一致）、
+  `BLOCK_NOT_TRUE`（区段从自身起点展开即含重复 row，末 row 回到区段起点
+  属正常闭合）、`UNKNOWN_BLOCK`（衔接规则引用未声明 block）、
+  `UNSATISFIABLE_LENGTH`（各 block 最少用量所需 change 超出
+  `max_changes`）；
+- `allowed_transitions`（白名单）/ `forbidden_transitions`（黑名单）约束
+  相邻 block 的衔接；同 block 延续始终允许，黑名单优先；
+- 响应给出各 block 的规范化摘要（区段、相对置换 `permutation`、call 数、
+  方法列表）与 `dependencies`（冻结的 touch、方法、call 与 ringproof 版本）。
+
+### 2. 搜索 block 组合
+
+```bash
+curl -X POST localhost:8765/block-compositions/bc/versions/1/search \
+  -H 'Content-Type: application/json' -d '{"max_results": 50}'
+```
+
+深度优先枚举（block 按声明顺序分支），按展开后的逐 row 检查**跨 block
+重复**（组合末 row 等于目标属正常达成，不算重复；到达目标即终止该
+路径），只返回满足用量、衔接、长度与末行要求的组合：
+
+- 剪枝：**端点可达性**（当前 row 到目标的最少 block 数，自目标反向 BFS
+  的安全下界）→ **剩余长度**（补足最少用量所需与可达 change 范围）→
+  **行交集**，分别计数 `pruned_by_reachability` / `pruned_by_length` /
+  `pruned_by_rows`（另有 `pruned_by_usage` / `pruned_by_transition`）；
+- 排序：**目标达成 → 总 change 数 → block 数 → call 数**（→ 确定性
+  字典序），`max_results` 保留最优；
+- `first_conflict` — 搜索中首次行交集冲突的两侧来源：block 序号与 id、
+  touch id/版本、组合内 change 与 block 内 change、对应的 `touch_change`、
+  `lead`、`method`/`method_id`/`method_version`、`call`、`notation`；
+- 每个结果给出 `sequence`（block id 序列）、`segments`（逐 block 起止
+  row、change 与 call 数）、`blocks_used`、`num_blocks` / `total_changes` /
+  `num_calls`、`final_row` 与 `target_reached`；
+- `max_search` 超出时截断并给出 `truncation_reason`；相同请求重复搜索
+  命中缓存（`X-Block-Search-Cache: hit`），结果一致。
+
 ## 示例
 
 ```bash
@@ -611,5 +691,5 @@ curl -X POST localhost:8765/multipart-analyses/mp/versions/1/enumerate \
 ## 测试
 
 ```bash
-python3 -m pytest tests/ -q   # 183 个用例
+python3 -m pytest tests/ -q   # 209 个用例
 ```

@@ -1,12 +1,15 @@
 """SQLite 不可变版本存储：方法、touch、音乐评分方案、all-the-work 覆盖方案、
-呼叫位置方案、composition 与编译（compilation）结果、multipart 校核分析。
+呼叫位置方案、composition 与编译（compilation）结果、multipart 校核分析、
+可复用 block 拼装（block composition）。
 
-方法、touch、评分方案、覆盖方案、位置方案、composition 与 multipart 分析以
-(id, version) 为主键只增不改；证明结果以 (touch_id, touch_version, music_id,
-music_version, coverage_id, coverage_version) 为主键缓存，编译结果以
-(composition_id, composition_version, request_hash) 为主键缓存，multipart
-枚举结果以 (analysis_id, analysis_version, request_hash) 为主键缓存，保证
-同一版本重复证明/编译/枚举结果一致。touch_music / touch_coverage 分别记录
+方法、touch、评分方案、覆盖方案、位置方案、composition、multipart 分析与
+block composition 以 (id, version) 为主键只增不改；证明结果以 (touch_id,
+touch_version, music_id, music_version, coverage_id, coverage_version) 为
+主键缓存，编译结果以 (composition_id, composition_version, request_hash)
+为主键缓存，multipart 枚举结果以 (analysis_id, analysis_version,
+request_hash) 为主键缓存，block 组合搜索结果以 (composition_id,
+composition_version, request_hash) 为主键缓存，保证同一版本重复
+证明/编译/枚举/搜索结果一致。touch_music / touch_coverage 分别记录
 touch 版本首次引用某评分/覆盖方案时冻结的版本。
 """
 from __future__ import annotations
@@ -181,6 +184,25 @@ CREATE TABLE IF NOT EXISTS multipart_enumerations (
     result_json TEXT NOT NULL,
     created_at TEXT NOT NULL,
     PRIMARY KEY (analysis_id, analysis_version, request_hash)
+);
+CREATE TABLE IF NOT EXISTS block_compositions (
+    id TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    stage INTEGER NOT NULL,
+    spec_json TEXT NOT NULL,
+    normalized_json TEXT NOT NULL,
+    input_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (id, version)
+);
+CREATE TABLE IF NOT EXISTS block_searches (
+    composition_id TEXT NOT NULL,
+    composition_version INTEGER NOT NULL,
+    request_hash TEXT NOT NULL,
+    input_hash TEXT NOT NULL,
+    result_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (composition_id, composition_version, request_hash)
 );
 """
 
@@ -801,6 +823,80 @@ class Storage:
                 (
                     rec["analysis_id"],
                     rec["analysis_version"],
+                    rec["request_hash"],
+                    rec["input_hash"],
+                    rec["result_json"],
+                    rec["created_at"],
+                ),
+            )
+            self._conn.commit()
+
+    # ---------------- 可复用 block 拼装 ----------------
+    def next_block_composition_version(self, composition_id: str) -> int:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT MAX(version) AS v FROM block_compositions WHERE id = ?",
+                (composition_id,),
+            ).fetchone()
+            return (row["v"] or 0) + 1
+
+    def insert_block_composition(self, rec: dict) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO block_compositions"
+                " (id, version, stage, spec_json, normalized_json, input_hash, created_at)"
+                " VALUES (?,?,?,?,?,?,?)",
+                (
+                    rec["id"],
+                    rec["version"],
+                    rec["stage"],
+                    rec["spec_json"],
+                    rec["normalized_json"],
+                    rec["input_hash"],
+                    rec["created_at"],
+                ),
+            )
+            self._conn.commit()
+
+    def get_block_composition(self, composition_id: str, version: int) -> dict | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM block_compositions WHERE id = ? AND version = ?",
+                (composition_id, version),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def list_block_compositions(self) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, version, stage, input_hash, created_at"
+                " FROM block_compositions ORDER BY id, version"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ---------------- block 组合搜索缓存 ----------------
+    def get_block_search(
+        self, composition_id: str, composition_version: int, request_hash: str
+    ) -> dict | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM block_searches"
+                " WHERE composition_id = ? AND composition_version = ?"
+                " AND request_hash = ?",
+                (composition_id, composition_version, request_hash),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def insert_block_search(self, rec: dict) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO block_searches"
+                " (composition_id, composition_version, request_hash, input_hash,"
+                " result_json, created_at)"
+                " VALUES (?,?,?,?,?,?)",
+                (
+                    rec["composition_id"],
+                    rec["composition_version"],
                     rec["request_hash"],
                     rec["input_hash"],
                     rec["result_json"],

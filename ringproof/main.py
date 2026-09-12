@@ -4,6 +4,10 @@
 不可变版本，每个 lead 可固定或候选方法，并可配置各方法配额与相邻转换规则。
 证明与枚举可引用不可变的音乐评分方案（精确 row / 前后端连续钟组 /
 指定钟位置三类规则），返回总分、各规则命中数与首次/最高分 row 来源。
+可复用 block 拼装：从多个不可变 touch 截取 lead-end 区段作为 block
+（转为相对起点的钟置换，可从不同 lead head 展开），设置使用次数与相邻
+衔接规则、限定总 change 数与目标末行，搜索满足约束且无跨 block 重复的
+组合。
 """
 from __future__ import annotations
 
@@ -17,6 +21,7 @@ from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse
 
 from . import __version__
+from .blocks import BlockError, block_summary, make_block, search_blocks
 from .compose import ComposeError, compile_composition, plain_course_length
 from .continuation import search_continuations
 from .coverage import analyze_coverage, coverage_summary
@@ -44,6 +49,8 @@ from .notation import (
 )
 from .prefix import replay_prefix
 from .schemas import (
+    BlockCompositionCreate,
+    BlockSearchRequest,
     CallDef,
     CompileRequest,
     CompositionCreate,
@@ -98,6 +105,10 @@ def create_app(db_path: str | None = None) -> FastAPI:
 
     @app.exception_handler(MultipartError)
     async def multipart_error_handler(_: Request, exc: MultipartError):
+        return JSONResponse(status_code=422, content={"detail": {"code": exc.code, "message": exc.message}})
+
+    @app.exception_handler(BlockError)
+    async def block_error_handler(_: Request, exc: BlockError):
         return JSONResponse(status_code=422, content={"detail": {"code": exc.code, "message": exc.message}})
 
     # ---------- 方法 ----------
@@ -1728,6 +1739,282 @@ def create_app(db_path: str | None = None) -> FastAPI:
         )
         return JSONResponse(payload, headers={"X-Multipart-Cache": "miss"})
 
+    # ---------- 可复用 block 拼装 ----------
+    @app.post("/block-compositions", status_code=201)
+    def create_block_composition(body: BlockCompositionCreate):
+        """创建 block 拼装的不可变版本：从多个不可变 touch 截取首尾落在
+        lead end 的区段作为可复用 block（转为相对起点的钟置换，可从不同
+        lead head 展开），设置使用次数与相邻衔接规则，限定总 change 数与
+        目标末行。钟数不一致、边界非法或区段自身为假时拒绝保存（不落库）。
+        touch 版本在此冻结（留空则取最新）。"""
+        blocks: list[dict] = []
+        touch_recs: dict[tuple[str, int], dict] = {}
+        expansions: dict[tuple[str, int], tuple] = {}
+        stage: int | None = None
+        for spec in body.blocks:
+            tv = spec.touch.version or storage.latest_touch_version(spec.touch.id)
+            touch_rec = storage.get_touch(spec.touch.id, tv) if tv else None
+            if not touch_rec:
+                detail = (
+                    f"touch 不存在: {spec.touch.id}"
+                    if spec.touch.version is None
+                    else f"touch 版本不存在: {spec.touch.id} v{spec.touch.version}"
+                )
+                return JSONResponse(status_code=404, content={"detail": detail})
+            key = (touch_rec["id"], touch_rec["version"])
+            if key not in expansions:
+                expansions[key] = _expand_touch_for_blocks(touch_rec)
+                touch_recs[key] = touch_rec
+            ctx, rows, events, lead_end_indices = expansions[key]
+            if stage is None:
+                stage = ctx["stage"]
+            elif ctx["stage"] != stage:
+                raise BlockError(
+                    "STAGE_MISMATCH",
+                    f"touch {key[0]!r} 为 {ctx['stage']} 口钟，"
+                    f"与前序 block 的 {stage} 口不一致",
+                )
+            blocks.append(
+                make_block(
+                    stage=stage,
+                    block_id=spec.id,
+                    touch_id=key[0],
+                    touch_version=key[1],
+                    rows=rows,
+                    events=events,
+                    lead_end_indices=lead_end_indices,
+                    start_change=spec.start_change,
+                    end_change=spec.end_change,
+                    min_uses=spec.min_uses,
+                    max_uses=spec.max_uses,
+                )
+            )
+
+        # 衔接规则引用的 block 须已声明
+        block_ids = {b["id"] for b in blocks}
+        for pair in (body.allowed_transitions or []) + (body.forbidden_transitions or []):
+            for x in pair:
+                if x not in block_ids:
+                    raise BlockError(
+                        "UNKNOWN_BLOCK", f"衔接规则引用了未声明的 block: {x!r}"
+                    )
+
+        start_row = (
+            parse_row(body.start_row, stage)
+            if body.start_row
+            else tuple(range(1, stage + 1))
+        )
+        target_row = parse_row(body.target_row, stage) if body.target_row else None
+
+        # 各 block 最少用量所需 change 须不超总 change 数上限
+        min_required = sum(b["min_uses"] * b["length"] for b in blocks)
+        if min_required > body.max_changes:
+            raise BlockError(
+                "UNSATISFIABLE_LENGTH",
+                f"各 block 的最少用量共需 {min_required} 个 change，"
+                f"超出 max_changes={body.max_changes}",
+            )
+
+        dependencies = _block_dependencies(blocks, touch_recs, expansions)
+        composition_id = body.id or _new_id()
+        version = storage.next_block_composition_version(composition_id)
+        spec_frozen = {
+            "name": body.name,
+            "blocks": [
+                {
+                    "id": b["id"],
+                    "touch": dict(b["touch"]),
+                    "start_change": b["start_change"],
+                    "end_change": b["end_change"],
+                    "min_uses": b["min_uses"],
+                    "max_uses": b["max_uses"],
+                }
+                for b in blocks
+            ],
+            "start_row": row_to_string(start_row),
+            "target_row": row_to_string(target_row) if target_row else None,
+            "min_changes": body.min_changes,
+            "max_changes": body.max_changes,
+            "allowed_transitions": (
+                sorted(tuple(p) for p in body.allowed_transitions)
+                if body.allowed_transitions is not None
+                else None
+            ),
+            "forbidden_transitions": sorted(
+                tuple(p) for p in (body.forbidden_transitions or [])
+            ),
+        }
+        input_hash = canonical_hash(
+            {
+                "blocks": [
+                    {
+                        "id": b["id"],
+                        "touch": {
+                            **b["touch"],
+                            "hash": touch_recs[(b["touch"]["id"], b["touch"]["version"])][
+                                "input_hash"
+                            ],
+                        },
+                        "start_change": b["start_change"],
+                        "end_change": b["end_change"],
+                        "min_uses": b["min_uses"],
+                        "max_uses": b["max_uses"],
+                    }
+                    for b in blocks
+                ],
+                "stage": stage,
+                "start_row": spec_frozen["start_row"],
+                "target_row": spec_frozen["target_row"],
+                "min_changes": body.min_changes,
+                "max_changes": body.max_changes,
+                "allowed_transitions": spec_frozen["allowed_transitions"],
+                "forbidden_transitions": spec_frozen["forbidden_transitions"],
+                "ringproof_version": __version__,
+            }
+        )
+        normalized = {
+            **spec_frozen,
+            "stage": stage,
+            "blocks": [block_summary(b) for b in blocks],
+            "dependencies": dependencies,
+        }
+        rec = {
+            "id": composition_id,
+            "version": version,
+            "stage": stage,
+            "spec_json": json.dumps(spec_frozen, ensure_ascii=False, sort_keys=True),
+            "normalized_json": json.dumps(normalized, ensure_ascii=False),
+            "input_hash": input_hash,
+            "created_at": utcnow(),
+        }
+        try:
+            storage.insert_block_composition(rec)
+        except sqlite3.IntegrityError:
+            return JSONResponse(status_code=409, content={"detail": "该 (id, version) 已存在，版本不可变"})
+        return JSONResponse(_block_composition_detail(rec), status_code=201)
+
+    @app.get("/block-compositions")
+    def list_block_compositions():
+        return {"block_compositions": storage.list_block_compositions()}
+
+    @app.get("/block-compositions/{composition_id}")
+    def list_block_composition_versions(composition_id: str):
+        versions = [
+            b for b in storage.list_block_compositions() if b["id"] == composition_id
+        ]
+        if not versions:
+            return JSONResponse(status_code=404, content={"detail": f"block composition 不存在: {composition_id}"})
+        return {"id": composition_id, "versions": versions}
+
+    @app.get("/block-compositions/{composition_id}/versions/{version}")
+    def get_block_composition(composition_id: str, version: int):
+        rec = storage.get_block_composition(composition_id, version)
+        if not rec:
+            return JSONResponse(status_code=404, content={"detail": f"block composition 版本不存在: {composition_id} v{version}"})
+        return _block_composition_detail(rec)
+
+    @app.post("/block-compositions/{composition_id}/versions/{version}/search")
+    def search_block_composition(composition_id: str, version: int, body: BlockSearchRequest):
+        """在冻结的 block 集合上搜索组合：按展开后的逐 row 检查跨 block
+        重复，只返回满足用量、衔接、长度与末行要求的组合；先按端点可达性、
+        剩余长度与行交集剪枝，再按目标达成 → 总 change 数 → block 数 →
+        call 数稳定排序；冲突列出相同 row 两侧的 block、touch、change、
+        method、call 来源。相同请求重复搜索命中缓存，结果一致。"""
+        rec = storage.get_block_composition(composition_id, version)
+        if not rec:
+            return JSONResponse(status_code=404, content={"detail": f"block composition 版本不存在: {composition_id} v{version}"})
+        request_key = {
+            "composition_hash": rec["input_hash"],
+            "max_results": body.max_results,
+            "max_search": body.max_search,
+            "ringproof_version": __version__,
+        }
+        request_hash = canonical_hash(request_key)
+        cached = storage.get_block_search(composition_id, version, request_hash)
+        if cached and cached["input_hash"] == rec["input_hash"]:
+            return JSONResponse(
+                json.loads(cached["result_json"]), headers={"X-Block-Search-Cache": "hit"}
+            )
+
+        spec = json.loads(rec["spec_json"])
+        normalized = json.loads(rec["normalized_json"])
+        stage = rec["stage"]
+        expansions: dict[tuple[str, int], tuple] = {}
+        blocks = []
+        for bs in spec["blocks"]:
+            key = (bs["touch"]["id"], bs["touch"]["version"])
+            if key not in expansions:
+                touch_rec = storage.get_touch(key[0], key[1])
+                if not touch_rec:
+                    return JSONResponse(
+                        status_code=422,
+                        content={"detail": {"code": "TOUCH_MISSING",
+                                            "message": f"composition 引用的 touch 版本缺失: {key[0]} v{key[1]}"}},
+                    )
+                expansions[key] = _expand_touch_for_blocks(touch_rec)
+            _, rows, events, lead_end_indices = expansions[key]
+            blocks.append(
+                make_block(
+                    stage=stage,
+                    block_id=bs["id"],
+                    touch_id=key[0],
+                    touch_version=key[1],
+                    rows=rows,
+                    events=events,
+                    lead_end_indices=lead_end_indices,
+                    start_change=bs["start_change"],
+                    end_change=bs["end_change"],
+                    min_uses=bs["min_uses"],
+                    max_uses=bs["max_uses"],
+                )
+            )
+
+        start_row = parse_row(spec["start_row"], stage)
+        target_row = parse_row(spec["target_row"], stage) if spec["target_row"] else None
+        allowed = (
+            {tuple(p) for p in spec["allowed_transitions"]}
+            if spec["allowed_transitions"] is not None
+            else None
+        )
+        forbidden = {tuple(p) for p in spec["forbidden_transitions"]}
+        search = search_blocks(
+            blocks=blocks,
+            start_row=start_row,
+            target=target_row,
+            min_changes=spec["min_changes"],
+            max_changes=spec["max_changes"],
+            allowed=allowed,
+            forbidden=forbidden,
+            max_results=body.max_results,
+            max_search=body.max_search,
+        )
+        payload = {
+            "composition_id": composition_id,
+            "composition_version": version,
+            "input_hash": rec["input_hash"],
+            "request_hash": request_hash,
+            "stage": stage,
+            "start_row": spec["start_row"],
+            "target_row": spec["target_row"],
+            "min_changes": spec["min_changes"],
+            "max_changes": spec["max_changes"],
+            "blocks": [block_summary(b) for b in blocks],
+            "sorted_by": ["target_reached", "total_changes", "num_blocks", "num_calls"],
+            "dependencies": normalized["dependencies"],
+            **search,
+        }
+        storage.insert_block_search(
+            {
+                "composition_id": composition_id,
+                "composition_version": version,
+                "request_hash": request_hash,
+                "input_hash": rec["input_hash"],
+                "result_json": json.dumps(payload, ensure_ascii=False),
+                "created_at": utcnow(),
+            }
+        )
+        return JSONResponse(payload, headers={"X-Block-Search-Cache": "miss"})
+
     # ---------- 部分 touch：前缀校核 ----------
     @app.post("/prefixes", status_code=201)
     def create_prefix(body: PrefixCreate):
@@ -2122,6 +2409,84 @@ def create_app(db_path: str | None = None) -> FastAPI:
         return {"status": "ok", "version": __version__}
 
     # ---------- 内部辅助 ----------
+    def _expand_touch_for_blocks(touch_rec: dict) -> tuple:
+        """展开 touch（冻结版本），返回 (ctx, rows, events, lead_end_indices)。
+
+        含未决 choice 槽位时抛 TouchError（422）；对同一 touch 版本完全确定。
+        """
+        ctx = _context_from_record(touch_rec)
+        leads = _resolve_leads(ctx)
+        result = prove_rows(
+            ctx["stage"],
+            ctx["method"]["name"],
+            leads,
+            ctx["start_row"],
+            ctx["max_calls"],
+            ctx["quotas"],
+            ctx["allowed"],
+            ctx["forbidden"],
+        )
+        rows = [ctx["start_row"]] + [
+            parse_row(ev["row"], ctx["stage"]) for ev in result["events"]
+        ]
+        return ctx, rows, result["events"], _lead_end_changes(leads)
+
+    def _block_dependencies(blocks: list[dict], touch_recs: dict, expansions: dict) -> dict:
+        """block composition 冻结的依赖版本：touch、方法与各 touch 的 call 定义。"""
+        touches: list[dict] = []
+        methods: dict[tuple[str, int], dict] = {}
+        calls: list[dict] = []
+        for b in blocks:
+            key = (b["touch"]["id"], b["touch"]["version"])
+            if any(t["id"] == key[0] and t["version"] == key[1] for t in touches):
+                continue
+            touches.append(
+                {"id": key[0], "version": key[1],
+                 "input_hash": touch_recs[key]["input_hash"]}
+            )
+            ctx = expansions[key][0]
+            for m in ctx["methods"]:
+                methods[(m["id"], m["version"])] = {
+                    "id": m["id"],
+                    "version": m["version"],
+                    "input_hash": m["input_hash"],
+                }
+            for name, c in sorted(ctx["call_defs"].items()):
+                calls.append(
+                    {
+                        "touch_id": key[0],
+                        "touch_version": key[1],
+                        "name": name,
+                        "notation": c["notation"],
+                        "replace": c["replace"],
+                    }
+                )
+        return {
+            "ringproof_version": __version__,
+            "touches": touches,
+            "methods": list(methods.values()),
+            "calls": calls,
+        }
+
+    def _block_composition_detail(rec: dict) -> dict:
+        normalized = json.loads(rec["normalized_json"])
+        return {
+            "id": rec["id"],
+            "version": rec["version"],
+            "name": normalized.get("name"),
+            "stage": rec["stage"],
+            "start_row": normalized["start_row"],
+            "target_row": normalized["target_row"],
+            "min_changes": normalized["min_changes"],
+            "max_changes": normalized["max_changes"],
+            "blocks": normalized["blocks"],
+            "allowed_transitions": normalized["allowed_transitions"],
+            "forbidden_transitions": normalized["forbidden_transitions"],
+            "dependencies": normalized["dependencies"],
+            "input_hash": rec["input_hash"],
+            "created_at": rec["created_at"],
+        }
+
     def _music_detail(rec: dict) -> dict:
         spec = json.loads(rec["spec_json"])
         return {
