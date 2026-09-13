@@ -713,13 +713,15 @@ POST /lead-graph-analyses
   - `reachable` / `distance`（最短 lead 数）/ `shortest_sequence`（动作名
     序列，目标即起点时为空列表）/ `alternative_count`（同长度动作序列数，
     **精确整数**，按 BFS 父节点路径数求和，不做浮点截断）；
-  - `preferred_route` — 同长度中 **call 数最少、动作字典序最小**的路线，
-    含逐 lead 的 call、前后 lead head 与 change 数；
-  - `routes` — 至多 `max_routes` 条按 **call 数 → 动作字典序**排列的
-    同长度候选，每条附 `truth`（逐 row 校核）与 `first_repeat`；
-    `routes_truncated` 表示候选数是否超过返回上限；
-  - `true_route` — 迭代加深 DFS 找到的**为真路线**（逐 row 无重复，末 row
-    回到起点属正常 come-round），优先最短、call 最少、字典序；
+  - `preferred_route` — 同长度中 **call 数最少、动作名称字典序最小**
+    （`bob < plain < single`，按动作名序列整体比较）的路线，含逐 lead 的
+    call、前后 lead head 与 change 数；
+  - `routes` — 至多 `max_routes` 条按 **call 数 → 动作名称字典序**排列的
+    同长度候选，每条附 `truth`（逐 row 校核，含 lead 内部重复）与
+    `first_repeat`；`routes_truncated` 表示候选数是否超过返回上限；
+  - `true_route` — 按 lead 数迭代加深 + A*（反向最少 call 边数为下界）
+    找到的**为真路线**，严格按 **lead 数 → call 数 → 动作名称字典序**取
+    第一条（逐 row 无重复，末 row 回到起点属正常 come-round）；
     `true_route_truncated` / `true_search_edges_checked` 说明预算；
 - `components` — 强连通分量（含单点分量，按分量内最小 lead head 排序），
   每分量给出 `nodes` 下标与 `lead_heads`；
@@ -740,8 +742,9 @@ curl localhost:8765/lead-graph-analyses/lg/versions/1?only_true=true
 ```
 
 各目标的 `routes` 只保留 `truth == "true"` 的候选（响应附
-`"filter": "only_true"`）；首选路线若为假，`preferred_route` 回落到为真
-路线。完整分析（图、分量、无回区域）保持不变。
+`"filter": "only_true"`）；`preferred_route` 取第一条为真的最短候选，其次
+回落已校核的 `true_route`，**没有任何为真路线时为 `null`（绝不回填假
+路线）**。完整分析（图、分量、无回区域）保持不变。
 
 ## 示例
 

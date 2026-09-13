@@ -204,9 +204,9 @@ def test_enumeration_order_prefers_plain_then_calls():
     assert lead["lead_head_after"] == "135264"
 
 
-def test_enumeration_global_order_on_diamond():
+def test_enumeration_order_by_call_then_action_name():
     # 菱形图：到节点 3 的两条序列 [plain,bob] 与 [bob,plain] 同为 1 个 call，
-    # 全局顺序按 call 数再按动作字典序 → plain,bob 在前
+    # 全局顺序按 call 数再按**动作名称**字典序（bob < plain）→ bob,plain 在前
     n0, n1, n2, n3 = (1, 2), (2, 1), (1, 3), (3, 1)
     g = {
         "nodes": [n0, n1, n2, n3],
@@ -224,16 +224,16 @@ def test_enumeration_global_order_on_diamond():
         "truncated": False,
     }
     s = shortest_structure(0, 3, g)
-    assert s["count"] == 2 and s["actions"] == ["plain", "bob"]
+    assert s["count"] == 2 and s["actions"] == ["bob", "plain"]
     variants = _variants([("bob", "14", 1)])
     routes, truncated = enumerate_shortest_routes(0, 3, s, g, variants, 10)
     assert truncated is False
     assert [r["actions"] for r in routes] == [
-        ["plain", "bob"], ["bob", "plain"],
+        ["bob", "plain"], ["plain", "bob"],
     ]
     assert [r["num_calls"] for r in routes] == [1, 1]
     routes1, _ = enumerate_shortest_routes(0, 3, s, g, variants, 1)
-    assert [r["actions"] for r in routes1] == [["plain", "bob"]]
+    assert [r["actions"] for r in routes1] == [["bob", "plain"]]
 
 
 def test_unreachable_target():
@@ -305,6 +305,69 @@ def test_search_true_route_simple_target():
     s = shortest_structure(0, 1, g)
     res = search_true_route(0, 1, s, g, variants, 20, 50000)
     assert res["route"]["actions"] == ["plain"]
+
+
+def test_search_true_route_prefers_fewer_calls_at_same_leads():
+    # 回归：152643 存在 5 lead / 2 call 的真路线时，不得选中 5 lead / 3 call
+    variants = _variants([("bob", "14", 1), ("single", "1234", 1)])
+    g = build_graph(ROUNDS6, variants, 20, 10000, set())
+    target = tuple(int(ch) for ch in "152643")
+    idx = g["index"][target]
+    s = shortest_structure(0, idx, g)
+    res = search_true_route(0, idx, s, g, variants, 20, 200000, "pb")
+    route = res["route"]
+    assert route is not None
+    assert route["num_leads"] == 5 and route["num_calls"] == 2
+    assert route["actions"] == ["bob", "plain", "bob", "plain", "plain"]
+    # 双保险：返回路线逐 row 校核确为真
+    truth = check_route_truth(
+        ROUNDS6, route["actions"], {v.action: v for v in variants}, "pb"
+    )
+    assert truth["truth"] == "true"
+
+
+def test_search_true_route_lex_order_among_equal_call_counts():
+    # 回归：145263 三条 4 lead / 2 call 真路线按动作名字典序取 bob,single,...
+    variants = _variants([("bob", "14", 1), ("single", "1234", 1)])
+    g = build_graph(ROUNDS6, variants, 20, 10000, set())
+    target = tuple(int(ch) for ch in "145263")
+    idx = g["index"][target]
+    s = shortest_structure(0, idx, g)
+    res = search_true_route(0, idx, s, g, variants, 20, 200000, "pb")
+    route = res["route"]
+    assert route["num_leads"] == 4 and route["num_calls"] == 2
+    assert route["actions"] == ["bob", "single", "plain", "plain"]
+    # 最短候选同样严格按动作名排序（plain 开头不再排在 bob 开头之前）
+    routes, _ = enumerate_shortest_routes(0, idx, s, g, variants, 20)
+    true_routes = [r for r in routes if r["num_calls"] == 2]
+    assert [r["actions"] for r in true_routes[:3]] == [
+        ["bob", "single", "plain", "plain"],
+        ["plain", "bob", "plain", "single"],
+        ["single", "bob", "plain", "plain"],
+    ]
+
+
+def test_intra_lead_repeat_makes_route_false_and_unsearchable():
+    # 方法 x.14.14（4 口钟）：从 1234 走 plain 到 2143，第 1、3 个 change 重复
+    from ringproof.notation import expand_notation as _exp
+
+    tokens, places = _exp("x.14.14", 4)
+    variants4 = build_variants(tokens, places, {})
+    g = build_graph((1, 2, 3, 4), variants4, 10, 10000, set())
+    target = (2, 1, 4, 3)
+    idx = g["index"][target]
+    truth = check_route_truth(
+        (1, 2, 3, 4), ["plain"], {v.action: v for v in variants4}, "m4"
+    )
+    assert truth["truth"] == "false"
+    rep = truth["first_repeat"]
+    assert rep["row"] == "2143"
+    assert (rep["first"]["lead"], rep["first"]["change_in_lead"]) == (1, 1)
+    assert (rep["second"]["lead"], rep["second"]["change_in_lead"]) == (1, 3)
+    # 为真搜索不得返回该假路线（没有其它为真路线时为 None）
+    s = shortest_structure(0, idx, g)
+    res = search_true_route(0, idx, s, g, variants4, 10, 50000, "m4")
+    assert res["route"] is None
 
 
 # ---------------- 组装分析 ----------------
@@ -386,6 +449,44 @@ def test_only_true_filter(client):
     assert g["filter"] == "only_true"
     for t in g["targets"]:
         assert all(rt["truth"] == "true" for rt in t["routes"])
+
+
+def test_only_true_does_not_backfill_false_route(client):
+    # 方法 x.14.14：plain lead 内部重复（2143 出现在第 1、3 个 change），
+    # 最短路线为假且没有为真替代 → only_true 不得回填假路线
+    client.post(
+        "/methods",
+        json={"id": "m4", "name": "Repeat Four", "stage": 4, "notation": "x.14.14"},
+    )
+    r = client.post(
+        "/lead-graph-analyses",
+        json={"id": "lg4", "method": {"id": "m4"}, "targets": ["2143"]},
+    )
+    assert r.status_code == 201
+    b = r.json()["targets"][0]
+    assert b["preferred_route"]["truth"] == "false"
+    assert b["true_route"] is None
+    g = client.get(
+        "/lead-graph-analyses/lg4/versions/1?only_true=true"
+    ).json()["targets"][0]
+    assert g["routes"] == []
+    assert g["preferred_route"] is None
+    assert g["true_route"] is None
+
+
+def test_true_route_strict_ordering_api(client):
+    # 回归：true_route 严格按 lead 数、call 数、动作名字典序
+    r = _create(client, id="ord", targets=["152643", "145263"])
+    b = r.json()
+    by_target = {t["target"]: t for t in b["targets"]}
+    tr = by_target["152643"]["true_route"]
+    assert (tr["num_leads"], tr["num_calls"], tr["actions"]) == (
+        5, 2, ["bob", "plain", "bob", "plain", "plain"],
+    )
+    tr2 = by_target["145263"]["true_route"]
+    assert (tr2["num_leads"], tr2["num_calls"], tr2["actions"]) == (
+        4, 2, ["bob", "single", "plain", "plain"],
+    )
 
 
 def test_frozen_method_version(client):

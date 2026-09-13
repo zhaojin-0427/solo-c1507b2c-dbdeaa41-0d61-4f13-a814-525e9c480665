@@ -19,6 +19,7 @@
 """
 from __future__ import annotations
 
+import collections
 import heapq
 from dataclasses import dataclass
 
@@ -297,9 +298,9 @@ def cannot_return_region(start_idx: int, graph: dict) -> list[int]:
 def shortest_structure(start_idx: int, target_idx: int, graph: dict) -> dict:
     """逐层 BFS：距离、同长度动作序列数、首选父边。
 
-    动作序列按 (call 数, 动作字典序) 比较：plain 优先于一切 call，call 之间
-    按名称字典序（与建图时 variants 的动作顺序一致）。首选序列为同长度中
-    call 数最少、动作字典序最小者。序列数为精确整数（大整数，不截断）。
+    动作序列按 (call 数, 动作名称字典序) 比较：call 数少者优先；同 call 数
+    按完整动作名序列的字符串字典序（"bob" < "plain" < "single"）。首选序列
+    为同长度中 call 数最少、动作字典序最小者。序列数为精确整数（大整数）。
     """
     edges, adj = graph["edges"], graph["adj"]
     dist = {start_idx: 0}
@@ -325,13 +326,13 @@ def shortest_structure(start_idx: int, target_idx: int, graph: dict) -> dict:
         for w, incoming in nxt.items():
             dist[w] = level
             counts[w] = sum(counts[e["from"]] for e in incoming)
-            # 首选父边：父节点首选序列追加本边动作后，(call 数, 字典序) 最优
+            # 首选父边：父节点首选序列追加本边动作后，(call 数, 动作名字典序) 最优
             best = min(
                 incoming,
-                key=lambda e: _extend_key(best_key[e["from"]], e["action_index"]),
+                key=lambda e: _extend_key(best_key[e["from"]], e["action"]),
             )
             best_parent[w] = {"edge": best, "parent": best["from"]}
-            best_key[w] = _extend_key(best_key[best["from"]], best["action_index"])
+            best_key[w] = _extend_key(best_key[best["from"]], best["action"])
             new_frontier.append(w)
         frontier = new_frontier
 
@@ -347,10 +348,10 @@ def shortest_structure(start_idx: int, target_idx: int, graph: dict) -> dict:
     }
 
 
-def _extend_key(key: tuple, action_index: int) -> tuple:
-    """父节点首选键 (call 数, action_index 序列) 追加一条动作后的键。"""
+def _extend_key(key: tuple, action: str) -> tuple:
+    """父节点首选键 (call 数, 动作名序列) 追加一条动作后的键。"""
     calls, seq = key
-    return (calls + (1 if action_index > 0 else 0), seq + (action_index,))
+    return (calls + (0 if action == "plain" else 1), seq + (action,))
 
 
 def _rebuild_actions(node: int, best_parent: dict, edges: list[dict]) -> list[str]:
@@ -373,11 +374,11 @@ def enumerate_shortest_routes(
     limit: int,
     pop_budget: int = 50000,
 ) -> tuple[list[dict], bool]:
-    """枚举至多 limit 条最短动作序列，按 (call 数, 动作字典序) 全局有序。
+    """枚举至多 limit 条最短动作序列，按 (call 数, 动作名字典序) 全局有序。
 
     在「只走 dist+1 的最短边」的 DAG 上用最小堆枚举：先反向标出能到达
-    目标的节点，再以完整序列 (call 数, action_index 元组) 为堆键逐层扩展，
-    每次弹出目标节点即得到下一最优路线。返回 (路线列表, 是否因预算截断)。
+    目标的节点，再以完整序列 (call 数, 动作名元组) 为堆键扩展，每次弹出
+    目标节点即得到下一最优路线。返回 (路线列表, 是否因预算截断)。
     """
     edges, adj = graph["edges"], graph["adj"]
     dist = shortest["dist"]
@@ -400,15 +401,16 @@ def enumerate_shortest_routes(
         return [], False
 
     results: list[dict] = []
-    # (calls, action_index 序列, 当前节点, 边路径)
-    heap: list[tuple] = [(0, (), start_idx, [])]
+    counter = 0
+    # (call 数, 动作名序列, 唯一序号, 当前节点, 边路径)
+    heap: list[tuple] = [(0, (), counter, start_idx, [])]
     pops = 0
     truncated = False
     while heap and len(results) < limit:
         if pops >= pop_budget:
             truncated = True
             break
-        calls, seq, v, path = heapq.heappop(heap)
+        calls, seq, _tie, v, path = heapq.heappop(heap)
         pops += 1
         if v == target_idx:
             results.append(_route_payload(path, graph, variants))
@@ -418,18 +420,19 @@ def enumerate_shortest_routes(
             w = e["to"]
             if w not in can_reach or dist.get(w) != dist[v] + 1:
                 continue
-            ai = e["action_index"]
+            counter += 1
+            action = e["action"]
             heapq.heappush(
                 heap,
                 (
-                    calls + (1 if ai > 0 else 0),
-                    seq + (ai,),
+                    calls + (0 if action == "plain" else 1),
+                    seq + (action,),
+                    counter,
                     w,
                     path + [e],
                 ),
             )
     return results, truncated
-
 
 
 def _route_payload(
@@ -466,11 +469,11 @@ def check_route_truth(
     variants_by_action: dict[str, LeadVariant],
     method_id: str,
 ) -> dict:
-    """逐 row 展开动作序列并校核真值。
+    """逐 row 展开动作序列并校核真值（lead head 与 lead 内全部 row）。
 
-    除末 row 回到起点（正常 come-round）外，任何重复 row（含 lead 中途）
-    均为假。重复时给出双方来源：method、lead、change（lead 内序号与全局
-    序号）、call。
+    除整条路线最后一个 change 的 row 回到起点（正常 come-round）外，任何
+    重复 row（含同一 lead 内部的重复）均为假。重复时给出双方来源：method、
+    lead（0 表示起点）、change_in_lead、全局 change 与该 lead 的 call。
     """
     seen: dict[tuple[int, ...], dict] = {
         start: {
@@ -485,6 +488,7 @@ def check_route_truth(
     change_no = 0
     for lead_no, action in enumerate(actions, 1):
         variant = variants_by_action[action]
+        intra_src: dict[tuple[int, ...], dict] = {}
         for pos, places in enumerate(variant.places, 1):
             cur = apply_change(cur, places)
             change_no += 1
@@ -497,6 +501,11 @@ def check_route_truth(
             }
             if cur in seen:
                 first = seen[cur]
+            elif cur in intra_src:
+                first = intra_src[cur]
+            else:
+                first = None
+            if first is not None:
                 is_come_round = (
                     cur == start
                     and lead_no == len(actions)
@@ -512,120 +521,16 @@ def check_route_truth(
                             "second": src,
                         },
                     }
-            else:
-                seen[cur] = src
+            intra_src[cur] = src
+            seen[cur] = src
     return {"truth": "true", "first_repeat": None}
 
 
-# ---------------- 为真路线搜索（迭代加深 DFS） ----------------
-
-
-def search_true_route(
-    start_idx: int,
-    target_idx: int,
-    shortest: dict,
-    graph: dict,
-    variants: list[LeadVariant],
-    max_leads: int,
-    budget: int,
-) -> dict:
-    """在可达图中搜索到达目标的**为真**路线，优先最短、call 最少、字典序。
-
-    迭代加深 DFS：深度下界取最短距离，图完整（未截断）时用反向 BFS 距离
-    做剩余 lead 数剪枝。逐 lead 展开 row，除末 row 回到起点外任何重复
-    row 立即剪枝。``budget`` 为边访问上限。返回路线（含逐 lead 信息）或
-    ``{"route": None, "truncated": ..., "edges_checked": ...}``。
-    """
-    edges, adj, nodes = graph["edges"], graph["adj"], graph["nodes"]
-    variants_by_action = {v.action: v for v in variants}
-    reverse_dist = None
-    if not graph["truncated"]:
-        reverse_dist = _reverse_distances(target_idx, graph)
-
-    work = {"edges": 0, "truncated": False}
-
-    def dfs(
-        v: int,
-        depth: int,
-        limit: int,
-        cur: tuple[int, ...],
-        path_rows: set[tuple[int, ...]],
-        edge_path: list[dict],
-    ) -> list[dict] | None:
-        # 目标即起点时，空路线不算往返；必须沿非空动作序列回到起点
-        if v == target_idx and depth > 0:
-            return list(edge_path)
-        if depth >= limit:
-            return None
-        if reverse_dist is not None:
-            rd = reverse_dist.get(v)
-            if rd is None or depth + rd > limit:
-                return None
-        for ei in adj[v]:
-            if work["edges"] >= budget:
-                work["truncated"] = True
-                return None
-            work["edges"] += 1
-            e = edges[ei]
-            w = e["to"]
-            variant = variants_by_action[e["action"]]
-            rows = lead_rows(cur, variant)
-            new_rows: list[tuple[int, ...]] = []
-            ok = True
-            for pos, row in enumerate(rows):
-                last_row_of_lead = pos == len(rows) - 1
-                if row in path_rows:
-                    # 唯一允许的重复：整条路线最后一个 lead 的末 row 回到起点
-                    is_come_round = (
-                        last_row_of_lead
-                        and w == target_idx
-                        and depth + 1 == limit
-                        and row == nodes[start_idx]
-                    )
-                    if not is_come_round:
-                        ok = False
-                        break
-                new_rows.append(row)
-            if not ok:
-                continue
-            # lead head 已在路径上而目标不在此节点：继续延伸必然重复，剪枝
-            if w != target_idx and rows[-1] in path_rows:
-                continue
-            inserted = [r for r in new_rows if r not in path_rows]
-            path_rows.update(inserted)
-            edge_path.append(e)
-            found = dfs(w, depth + 1, limit, rows[-1], path_rows, edge_path)
-            edge_path.pop()
-            if found is not None:
-                return found
-            for row in inserted:
-                path_rows.discard(row)
-        return None
-
-    lower = shortest["distance"]
-    if lower is None:
-        return {"route": None, "truncated": False, "edges_checked": work["edges"]}
-    # 目标即起点：最短空路线不算往返，至少需要 1 个 lead
-    lower_loop = max(lower, 1 if target_idx == start_idx else 0)
-    for limit in range(lower_loop, max_leads + 1):
-        found = dfs(start_idx, 0, limit, nodes[start_idx], {nodes[start_idx]}, [])
-        if found is not None:
-            return {
-                "route": _route_payload(found, graph, variants),
-                "truncated": work["truncated"],
-                "edges_checked": work["edges"],
-                "search_leads": limit,
-            }
-        if work["truncated"]:
-            break
-    return {
-        "route": None,
-        "truncated": work["truncated"],
-        "edges_checked": work["edges"],
-    }
+# ---------------- 反向距离与为真路线搜索（A*） ----------------
 
 
 def _reverse_distances(target_idx: int, graph: dict) -> dict[int, int]:
+    """自目标沿反向边的最少边（lead）数；图截断时仅覆盖反向可达部分。"""
     edges = graph["edges"]
     rev: dict[int, list[int]] = {i: [] for i in range(len(graph["nodes"]))}
     for e in edges:
@@ -643,6 +548,166 @@ def _reverse_distances(target_idx: int, graph: dict) -> dict[int, int]:
                     nxt.append(w)
         frontier = nxt
     return dist
+
+
+def _reverse_call_distances(target_idx: int, graph: dict) -> dict[int, int]:
+    """自目标沿反向边的最少 **call**（非 plain）边数（0-1 BFS，可采纳下界）。"""
+    n = len(graph["nodes"])
+    rev: dict[int, list[tuple[int, int]]] = {i: [] for i in range(n)}
+    for e in graph["edges"]:
+        cost = 0 if e["call"] is None else 1
+        rev[e["to"]].append((e["from"], cost))
+    dist = {target_idx: 0}
+    dq = collections.deque([target_idx])
+    while dq:
+        v = dq.popleft()
+        for w, cost in rev[v]:
+            nd = dist[v] + cost
+            if w not in dist or nd < dist[w]:
+                dist[w] = nd
+                if cost:
+                    dq.append(w)
+                else:
+                    dq.appendleft(w)
+    return dist
+
+
+def _extend_lead(
+    cur: tuple[int, ...],
+    variant: LeadVariant,
+    end_node: int,
+    target_idx: int,
+    is_final: bool,
+    start_row: tuple[int, ...],
+    path_rows: frozenset,
+) -> tuple[bool, list[tuple[int, ...]], tuple[int, ...]]:
+    """逐 change 检查一个 lead 的全部 row。
+
+    lead 内部不得重复；除「整路线最后一个 lead 的末 row 回到起点」外，任何
+    row 不得与已有路径（含 lead 中途）重复。返回 (是否为真, 本 lead 新增
+    row, 末 row)。
+    """
+    rows = lead_rows(cur, variant)
+    intra: set[tuple[int, ...]] = set()
+    new_rows: list[tuple[int, ...]] = []
+    for pos, row in enumerate(rows):
+        last_change = pos == len(rows) - 1
+        come_round = (
+            is_final and last_change and end_node == target_idx and row == start_row
+        )
+        if row in intra:
+            return False, [], rows[-1]
+        if row in path_rows and not come_round:
+            return False, [], rows[-1]
+        intra.add(row)
+        if row not in path_rows:
+            new_rows.append(row)
+    return True, new_rows, rows[-1]
+
+
+def search_true_route(
+    start_idx: int,
+    target_idx: int,
+    shortest: dict,
+    graph: dict,
+    variants: list[LeadVariant],
+    max_leads: int,
+    budget: int,
+    method_id: str = "",
+) -> dict:
+    """搜索到达目标的**为真**路线，严格按 (lead 数, call 数, 动作名字典序)
+    取第一条。
+
+    外层按 lead 数迭代加深（自最短距离起）；固定 lead 数内做 A*：下界为
+    自当前节点到目标的反向最少 call 边数（0-1 BFS，可采纳），堆键为
+    (已用 call 数 + 下界, 动作名序列)。逐 lead 检查**全部 row**（含 lead
+    内部重复与 lead 中途撞上路径 row），唯一允许的重复是整路线最后一个
+    change 回到起点。``budget`` 为 lead 扩展上限。
+    """
+    edges, adj, nodes = graph["edges"], graph["adj"], graph["nodes"]
+    variants_by_action = {v.action: v for v in variants}
+    rev_leads = _reverse_distances(target_idx, graph)
+    rev_calls = _reverse_call_distances(target_idx, graph)
+    start_row = nodes[start_idx]
+    pushed = 0
+    truncated = False
+
+    lower = shortest["distance"]
+    if lower is None:
+        return {"route": None, "truncated": False, "edges_checked": pushed}
+    lower_loop = max(lower, 1 if target_idx == start_idx else 0)
+
+    for limit in range(lower_loop, max_leads + 1):
+        # (已用 call 数 + call 下界, 动作名序列, 唯一序号, 节点, 深度,
+        #  当前末 row, 已出现 row, 边路径)
+        counter = 0
+        heap = [
+            (rev_calls.get(start_idx, 10 ** 9), (), counter,
+             start_idx, 0, start_row, frozenset({start_row}), [])
+        ]
+        while heap:
+            _f, seq, _tie, v, depth, cur, path_rows, path = heapq.heappop(heap)
+            if depth == limit:
+                if v == target_idx and depth > 0:
+                    payload = _route_payload(path, graph, variants)
+                    truth = check_route_truth(
+                        start_row, payload["actions"], variants_by_action,
+                        method_id,
+                    )
+                    if truth["truth"] == "true":
+                        return {
+                            "route": payload,
+                            "truncated": truncated,
+                            "edges_checked": pushed,
+                            "search_leads": limit,
+                        }
+                continue
+            remaining_after = limit - depth - 1
+            for ei in adj[v]:
+                if pushed >= budget:
+                    truncated = True
+                    break
+                e = edges[ei]
+                w = e["to"]
+                rd = rev_leads.get(w)
+                if rd is None or rd > remaining_after:
+                    continue
+                variant = variants_by_action[e["action"]]
+                is_final = depth + 1 == limit
+                ok, new_rows, end_row = _extend_lead(
+                    cur, variant, w, target_idx, is_final,
+                    start_row, path_rows,
+                )
+                if not ok:
+                    continue
+                pushed += 1
+                calls_used = sum(1 for x in path if x["call"] is not None)
+                calls_used += 0 if e["call"] is None else 1
+                action = e["action"]
+                counter += 1
+                heapq.heappush(
+                    heap,
+                    (
+                        calls_used + rev_calls.get(w, 10 ** 9),
+                        seq + (action,),
+                        counter,
+                        w,
+                        depth + 1,
+                        end_row,
+                        path_rows.union(new_rows),
+                        path + [e],
+                    ),
+                )
+            if truncated:
+                break
+        if truncated:
+            break
+
+    return {
+        "route": None,
+        "truncated": truncated,
+        "edges_checked": pushed,
+    }
 
 
 # ---------------- 组装分析 ----------------
@@ -707,14 +772,17 @@ def analyze_reachability(
                 route["truth"] = truth["truth"]
                 route["first_repeat"] = truth["first_repeat"]
             true_search = search_true_route(
-                0, t_idx, shortest, graph, variants, max_leads, true_search_budget
+                0, t_idx, shortest, graph, variants, max_leads,
+                true_search_budget, method_id,
             )
+            # 首选路线为排序后的第一条最短路线（可能为假，供调用方对照）
+            preferred = routes[0] if routes else None
             entry.update(
                 {
                     "distance": shortest["distance"],
                     "shortest_sequence": shortest["actions"],
                     "alternative_count": shortest["count"],
-                    "preferred_route": routes[0] if routes else None,
+                    "preferred_route": preferred,
                     "routes": routes,
                     "routes_returned": len(routes),
                     "routes_truncated": routes_truncated

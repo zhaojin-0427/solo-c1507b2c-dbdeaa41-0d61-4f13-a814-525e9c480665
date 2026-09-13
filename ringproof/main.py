@@ -2408,11 +2408,18 @@ def create_app(db_path: str | None = None) -> FastAPI:
         payload = json.loads(rec["result_json"])
         if only_true:
             for t in payload["targets"]:
-                true_routes = [r for r in t["routes"] if r["truth"] == "true"]
-                t["routes"] = true_routes
-                t["routes_returned"] = len(true_routes)
-                if t["preferred_route"] is not None and t["preferred_route"]["truth"] != "true":
+                all_routes = t["routes"]
+                true_shortest = [r for r in all_routes if r["truth"] == "true"]
+                t["routes"] = true_shortest
+                t["routes_returned"] = len(true_shortest)
+                # 首选须确为真：优先第一条为真的最短路线，其次已逐 row 校核的
+                # true_route；都没有则置 null（绝不回填假路线）
+                if true_shortest:
+                    t["preferred_route"] = true_shortest[0]
+                elif t.get("true_route") is not None:
                     t["preferred_route"] = t["true_route"]
+                else:
+                    t["preferred_route"] = None
             payload["filter"] = "only_true"
         return payload
 
