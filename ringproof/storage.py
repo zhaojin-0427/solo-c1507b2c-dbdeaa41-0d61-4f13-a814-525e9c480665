@@ -1,10 +1,10 @@
 """SQLite 不可变版本存储：方法、touch、音乐评分方案、all-the-work 覆盖方案、
 呼叫位置方案、composition 与编译（compilation）结果、multipart 校核分析、
 可复用 block 拼装（block composition）、方法相假图谱（falseness 分析）、
-lead-head 可达图（lead graph 分析）。
+lead-head 可达图（lead graph 分析）、round block 等价分析。
 
 方法、touch、评分方案、覆盖方案、位置方案、composition、multipart 分析、
-block composition 与 falseness 分析以 (id, version) 为主键只增不改；证明结果以 (touch_id,
+block composition、falseness 分析与 round block 分析以 (id, version) 为主键只增不改；证明结果以 (touch_id,
 touch_version, music_id, music_version, coverage_id, coverage_version) 为
 主键缓存，编译结果以 (composition_id, composition_version, request_hash)
 为主键缓存，multipart 枚举结果以 (analysis_id, analysis_version,
@@ -221,6 +221,16 @@ CREATE TABLE IF NOT EXISTS lead_graph_analyses (
     stage INTEGER NOT NULL,
     method_id TEXT NOT NULL,
     method_version INTEGER NOT NULL,
+    spec_json TEXT NOT NULL,
+    result_json TEXT NOT NULL,
+    input_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (id, version)
+);
+CREATE TABLE IF NOT EXISTS round_block_analyses (
+    id TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    stage INTEGER NOT NULL,
     spec_json TEXT NOT NULL,
     result_json TEXT NOT NULL,
     input_hash TEXT NOT NULL,
@@ -1014,6 +1024,49 @@ class Storage:
             rows = self._conn.execute(
                 "SELECT id, version, stage, method_id, method_version, input_hash,"
                 " created_at FROM lead_graph_analyses ORDER BY id, version"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ---------------- round block 等价分析 ----------------
+    def next_round_block_version(self, analysis_id: str) -> int:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT MAX(version) AS v FROM round_block_analyses WHERE id = ?",
+                (analysis_id,),
+            ).fetchone()
+            return (row["v"] or 0) + 1
+
+    def insert_round_block(self, rec: dict) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO round_block_analyses"
+                " (id, version, stage, spec_json, result_json, input_hash, created_at)"
+                " VALUES (?,?,?,?,?,?,?)",
+                (
+                    rec["id"],
+                    rec["version"],
+                    rec["stage"],
+                    rec["spec_json"],
+                    rec["result_json"],
+                    rec["input_hash"],
+                    rec["created_at"],
+                ),
+            )
+            self._conn.commit()
+
+    def get_round_block(self, analysis_id: str, version: int) -> dict | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM round_block_analyses WHERE id = ? AND version = ?",
+                (analysis_id, version),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def list_round_blocks(self) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, version, stage, input_hash, created_at"
+                " FROM round_block_analyses ORDER BY id, version"
             ).fetchall()
         return [dict(r) for r in rows]
 

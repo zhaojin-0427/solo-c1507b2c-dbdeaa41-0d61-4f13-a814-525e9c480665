@@ -71,6 +71,18 @@ lead head 的转移保存为**独立分析版本**，并引用不可变方法版
 lead、change 与 call，也可用 `only_true=true` 只看为真的路线。分析冻结
 方法、call、约束与输入哈希，重复查询保持一致。
 
+支持 **round block 等价分析**：以 2～50 个不可变 touch 版本为对象，
+独立记录允许的 lead 边界循环移位（`shift_changes`，缺省为全部 lead
+end）、反向展开开关与必须固定的钟；钟数不一致、touch 未闭合回到
+rounds、移位点不在 lead end，或归一化会改动固定钟时拒绝创建。系统从
+每个合法边界重开序列、把起行重标为 rounds，连同可选反向序列生成规范
+指纹（全部候选中字典序最小的规范化序列），指纹相同者归并为等价
+composition，并按 (touch id, version) 字典序稳定选出代表项。每个成员
+返回相对代表项的移位 lead、方向、钟号映射与逐 row 对照（compare 接口
+分页返回）；不等价的两项给出规范指纹的最早分歧 row，以及双方在原
+touch 中的 method、lead、call 来源。分析版本写入 SQLite，冻结全部
+touch 依赖与变换规则，同一分析重复读取保持一致。
+
 ## 运行
 
 ```bash
@@ -133,6 +145,9 @@ python3 -m uvicorn ringproof.main:app --port 8765
 | GET | `/falseness-analyses/{id}/versions/{v}` | 各 course 闭合长度与内部真值、共享 row 矩阵、首次冲突、连通分组、截断状态与检查数量；`only_true_disjoint=true` 筛选为真且互不相交的组合 |
 | POST | `/lead-graph-analyses` | 创建 lead-head 可达图版本（引用不可变方法版本；起始 lead head、call 定义、1~20 目标、max_leads、max_states、禁用 lead head） |
 | GET | `/lead-graph-analyses/{id}/versions/{v}` | 图节点/边、目标可达性/最短动作序列/同长度备选数/候选路线逐 row 真值/为真路线、强连通分量、无法返回起点区域、截断原因；`only_true=true` 只返回为真路线 |
+| POST | `/round-block-analyses` | 创建 round block 等价分析版本（2~50 个不可变 touch；独立记录允许的 lead 边界移位、反向展开与固定钟；冻结 touch/方法/call 依赖与变换规则） |
+| GET | `/round-block-analyses/{id}/versions/{v}` | 各 touch 的合法移位与规范指纹、等价分组与代表项、成员相对代表项的移位/方向/钟号映射 |
+| GET | `/round-block-analyses/{id}/versions/{v}/compare` | 两个成员对照：等价时给出方向/移位/钟号映射与逐 row 对照（分页）；不等价时给出最早分歧 row 与双方 method/lead/call 来源 |
 
 ### 证明结果字段
 

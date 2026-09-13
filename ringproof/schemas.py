@@ -811,3 +811,55 @@ class LeadGraphCreate(BaseModel):
         if len(set(self.forbidden_lead_heads)) != len(self.forbidden_lead_heads):
             raise ValueError("forbidden_lead_heads 列表存在重复排列")
         return self
+
+
+# ---------------- Round block 等价分析 ----------------
+
+
+class RoundBlockAnalysisCreate(BaseModel):
+    """创建 round block 等价分析的不可变版本。
+
+    以 2～50 个不可变 touch 版本为对象（版本留空则冻结为最新），独立记录
+    允许的 lead 边界循环移位（``shift_changes`` 为 change 序号，0 表示原始
+    起行，缺省为每个 touch 的全部 lead end）、是否允许反向展开，以及必须
+    固定的钟（归一化不得改动）。touch 未闭合回到 rounds、移位点不在
+    lead end、钟数不一致或归一化会改动固定钟时拒绝创建（不落库）。
+    """
+
+    id: str | None = Field(default=None, description="留空则自动生成；同名 id 递增版本")
+    name: str | None = Field(default=None, max_length=200)
+    touches: list[TouchRef] = Field(
+        min_length=2,
+        max_length=50,
+        description="参与等价分析的不可变 touch 版本（2~50 个，版本留空则冻结为最新）",
+    )
+    shift_changes: list[int] | None = Field(
+        default=None,
+        description="允许的循环移位点（change 序号，0 为原始起行，须为各 touch 的 lead end）；"
+        "null 表示全部 lead end",
+    )
+    allow_reverse: bool = Field(
+        default=False, description="是否允许反向展开参与等价判定"
+    )
+    fixed_bells: list[int] = Field(
+        default_factory=list,
+        description="必须固定的钟：归一化不得改动（1..stage，不重复）",
+    )
+
+    @model_validator(mode="after")
+    def _check(self) -> "RoundBlockAnalysisCreate":
+        keys = [(t.id, t.version) for t in self.touches]
+        if len(set(keys)) != len(keys):
+            raise ValueError("touches 列表存在重复的 touch 版本引用")
+        if self.shift_changes is not None:
+            if not self.shift_changes:
+                raise ValueError("shift_changes 不能为空列表；不加移位限制请用 null")
+            if len(set(self.shift_changes)) != len(self.shift_changes):
+                raise ValueError("shift_changes 存在重复移位点")
+            if any(s < 0 for s in self.shift_changes):
+                raise ValueError("shift_changes 须为非负 change 序号")
+        if len(set(self.fixed_bells)) != len(self.fixed_bells):
+            raise ValueError("fixed_bells 存在重复钟号")
+        if any(not 1 <= b <= 12 for b in self.fixed_bells):
+            raise ValueError("fixed_bells 钟号须在 1..12 范围内")
+        return self

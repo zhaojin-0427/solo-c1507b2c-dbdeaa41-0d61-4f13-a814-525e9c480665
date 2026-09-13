@@ -13,6 +13,11 @@
 lead-head 可达图：以 lead head 为节点、plain/bob/single/自定义 call 为
 有向边，逐层 BFS 建图并返回目标可达性、最短动作序列、同长度备选数、
 候选路线逐 row 真值、为真路线、强连通分量、无法返回起点的区域与截断原因。
+round block 等价分析：以 2～50 个不可变 touch 版本为对象，独立记录允许的
+lead 边界循环移位、反向展开与必须固定的钟；从每个合法边界重开序列并把
+起行重标为 rounds，连同可选反向序列生成规范指纹，据此归并等价
+composition 并稳定选出代表项；成员返回相对代表项的移位、方向、钟号映射
+与逐 row 对照，不等价的两项给出最早分歧 row 及双方 method/lead/call 来源。
 """
 from __future__ import annotations
 
@@ -44,6 +49,7 @@ from .multipart import (
     MultipartError,
     analyze_segment,
     enumerate_segments,
+    permute_row,
 )
 from .music import score_rows, validate_rules
 from .notation import (
@@ -59,6 +65,23 @@ from .reachability import (
     ReachabilityError,
     analyze_reachability,
     build_variants,
+)
+from .roundblock import (
+    MAX_SHIFT_CELLS,
+    MAX_TOTAL_CELLS,
+    MAX_TOUCH_CHANGES,
+    RoundBlockError,
+    alignment,
+    bell_mapping_images,
+    canonical_fingerprint,
+    fingerprint_hash,
+    first_divergence,
+    lead_of_change,
+    normalize_rows,
+    original_change,
+    perm_payload,
+    row_provenance,
+    shift_lead,
 )
 from .schemas import (
     BlockCompositionCreate,
@@ -79,6 +102,7 @@ from .schemas import (
     PositionSchemeCreate,
     PrefixCreate,
     ProveRequest,
+    RoundBlockAnalysisCreate,
     TouchCreate,
 )
 from .schemas import _validate_call_ref
@@ -131,6 +155,10 @@ def create_app(db_path: str | None = None) -> FastAPI:
 
     @app.exception_handler(ReachabilityError)
     async def reachability_error_handler(_: Request, exc: ReachabilityError):
+        return JSONResponse(status_code=422, content={"detail": {"code": exc.code, "message": exc.message}})
+
+    @app.exception_handler(RoundBlockError)
+    async def round_block_error_handler(_: Request, exc: RoundBlockError):
         return JSONResponse(status_code=422, content={"detail": {"code": exc.code, "message": exc.message}})
 
     # ---------- 方法 ----------
@@ -2423,6 +2451,466 @@ def create_app(db_path: str | None = None) -> FastAPI:
             payload["filter"] = "only_true"
         return payload
 
+    # ---------- round block 等价分析 ----------
+    @app.post("/round-block-analyses", status_code=201)
+    def create_round_block_analysis(body: RoundBlockAnalysisCreate):
+        """创建 round block 等价分析的不可变版本：以 2～50 个不可变 touch
+        版本为对象，独立记录允许的 lead 边界循环移位（缺省为全部 lead end）、
+        反向展开与必须固定的钟。系统从每个合法边界重开序列、把起行重标为
+        rounds，连同可选反向序列生成规范指纹，据此归并等价 composition 并
+        按 (touch id, version) 字典序稳定选出代表项。钟数不一致、touch 未
+        闭合回到 rounds、移位点不在 lead end，或归一化会改动固定钟时拒绝
+        创建（不落库）。touch 版本在此冻结（留空则取最新）。"""
+        # 解析并展开 touch（冻结版本）；含未决 choice 槽位时抛 422
+        resolved: list[dict] = []
+        seen_keys: set[tuple[str, int]] = set()
+        for ref in body.touches:
+            tv = ref.version or storage.latest_touch_version(ref.id)
+            touch_rec = storage.get_touch(ref.id, tv) if tv else None
+            if not touch_rec:
+                detail = (
+                    f"touch 不存在: {ref.id}"
+                    if ref.version is None
+                    else f"touch 版本不存在: {ref.id} v{ref.version}"
+                )
+                return JSONResponse(status_code=404, content={"detail": detail})
+            key = (touch_rec["id"], touch_rec["version"])
+            if key in seen_keys:
+                raise RoundBlockError(
+                    "DUPLICATE_TOUCH", f"touch 版本重复引用: {key[0]} v{key[1]}"
+                )
+            seen_keys.add(key)
+            ctx, rows, events, lead_ends = _expand_touch_for_blocks(touch_rec)
+            resolved.append(
+                {
+                    "rec": touch_rec,
+                    "ctx": ctx,
+                    "rows": rows,
+                    "events": events,
+                    "lead_ends": lead_ends,
+                }
+            )
+
+        stage = resolved[0]["ctx"]["stage"]
+        for item in resolved[1:]:
+            if item["ctx"]["stage"] != stage:
+                raise RoundBlockError(
+                    "STAGE_MISMATCH",
+                    f"touch {item['rec']['id']!r} 为 {item['ctx']['stage']} 口钟，"
+                    f"与 {resolved[0]['rec']['id']!r} 的 {stage} 口不一致",
+                )
+        rounds = tuple(range(1, stage + 1))
+        for b in body.fixed_bells:
+            if not 1 <= b <= stage:
+                raise RoundBlockError(
+                    "BELL_OUT_OF_RANGE",
+                    f"必须固定的钟 {b} 超出 1..{stage} 范围",
+                )
+
+        # 逐 touch：闭合校验、移位点校验、固定钟校验、规模上限
+        total_cells = 0
+        for item in resolved:
+            rec, rows, lead_ends = item["rec"], item["rows"], item["lead_ends"]
+            n = len(rows) - 1
+            label = f"touch {rec['id']!r} v{rec['version']}"
+            if rows[0] != rounds or rows[-1] != rounds:
+                raise RoundBlockError(
+                    "NOT_ROUND_BLOCK",
+                    f"{label} 未闭合回到 rounds（起始 {row_to_string(rows[0])}，"
+                    f"末尾 {row_to_string(rows[-1])}），不能作为 round block",
+                )
+            if n > MAX_TOUCH_CHANGES:
+                raise RoundBlockError(
+                    "TOO_MANY_CHANGES",
+                    f"{label} 共 {n} 个 change，超过上限 {MAX_TOUCH_CHANGES}",
+                )
+            if body.shift_changes is None:
+                # 全部 lead 边界（末尾 lead end 与起点 0 等价，不重复计入）
+                shifts = [0] + [e for e in lead_ends if e != n]
+            else:
+                lead_end_set = set(lead_ends)
+                for s in body.shift_changes:
+                    if s != 0 and s not in lead_end_set:
+                        raise RoundBlockError(
+                            "NOT_LEAD_END",
+                            f"移位点 {s} 不是 {label} 的 lead end"
+                            f"（lead end 为 {lead_ends}，0 为起始 row）",
+                        )
+                shifts = sorted(body.shift_changes)
+            # 归一化不得改动必须固定的钟：钟 b 须位于起行第 b 位
+            for s in shifts:
+                open_row = rows[s]
+                for b in body.fixed_bells:
+                    if open_row[b - 1] != b:
+                        raise RoundBlockError(
+                            "FIXED_BELL_DISPLACED",
+                            f"{label} 从 change {s}（lead "
+                            f"{shift_lead(lead_ends, s)}）重开时，归一化会把固定的钟 {b} "
+                            f"重标为 {open_row.index(b) + 1}（起行 "
+                            f"{row_to_string(open_row)} 中钟 {b} 位于第 "
+                            f"{open_row.index(b) + 1} 位）",
+                        )
+            item["shifts"] = shifts
+            item["n"] = n
+            cells = len(shifts) * (2 if body.allow_reverse else 1) * (n + 1)
+            if cells > MAX_SHIFT_CELLS:
+                raise RoundBlockError(
+                    "TOO_MANY_SHIFTS",
+                    f"{label} 的移位候选共 {cells} 个移位单元，超过上限 "
+                    f"{MAX_SHIFT_CELLS}；请用 shift_changes 收紧允许的移位点",
+                )
+            total_cells += cells
+            if total_cells > MAX_TOTAL_CELLS:
+                raise RoundBlockError(
+                    "TOO_MANY_SHIFTS",
+                    f"全部 touch 的移位候选共超过 {MAX_TOTAL_CELLS} 个移位单元；"
+                    "请用 shift_changes 收紧允许的移位点",
+                )
+
+        # 规范指纹与等价归并
+        for item in resolved:
+            seq, best_shift, best_dir = canonical_fingerprint(
+                item["rows"], item["shifts"], body.allow_reverse
+            )
+            item["sequence"] = seq
+            item["best_shift"] = best_shift
+            item["best_dir"] = best_dir
+            item["fp_hash"] = fingerprint_hash(stage, seq)
+
+        groups: list[dict] = []
+        group_of: dict[int, int] = {}
+        group_by_hash: dict[str, dict] = {}
+        for idx, item in enumerate(resolved):
+            g = group_by_hash.get(item["fp_hash"])
+            if g is None:
+                g = {"hash": item["fp_hash"], "members": []}
+                group_by_hash[item["fp_hash"]] = g
+                groups.append(g)
+            g["members"].append(idx)
+            group_of[idx] = len(groups)  # 组号 1 起
+        for g in groups:
+            g["representative"] = min(
+                g["members"],
+                key=lambda i: (resolved[i]["rec"]["id"], resolved[i]["rec"]["version"]),
+            )
+
+        # 成员相对代表项的移位、方向、钟号映射与逐 row 校核
+        member_payloads = []
+        for idx, item in enumerate(resolved):
+            g = groups[group_of[idx] - 1]
+            rep = resolved[g["representative"]]
+            n = item["n"]
+            if item is rep:
+                rel = {
+                    "direction": "forward",
+                    "shift_change": 0,
+                    "shift_lead": 0,
+                    "bell_mapping": perm_payload(rounds),
+                    "rows_total": n + 1,
+                    "rows_matched": n + 1,
+                }
+            else:
+                direction, delta, align = alignment(
+                    {"shift": item["best_shift"], "direction": item["best_dir"]},
+                    {"shift": rep["best_shift"], "direction": rep["best_dir"]},
+                    n,
+                )
+                images = bell_mapping_images(
+                    item["rows"][item["best_shift"]],
+                    rep["rows"][rep["best_shift"]],
+                )
+                matched = sum(
+                    1
+                    for j in range(n + 1)
+                    if permute_row(images, rep["rows"][align(j)]) == item["rows"][j]
+                )
+                rel = {
+                    "direction": direction,
+                    "shift_change": delta,
+                    "shift_lead": shift_lead(rep["lead_ends"], delta),
+                    "bell_mapping": perm_payload(images),
+                    "rows_total": n + 1,
+                    "rows_matched": matched,
+                }
+            member_payloads.append(
+                {
+                    "touch": {
+                        "id": item["rec"]["id"],
+                        "version": item["rec"]["version"],
+                        "input_hash": item["rec"]["input_hash"],
+                    },
+                    "total_changes": n,
+                    "total_leads": len(item["lead_ends"]),
+                    "lead_end_changes": item["lead_ends"],
+                    "allowed_shifts": [
+                        {"change": s, "lead": shift_lead(item["lead_ends"], s)}
+                        for s in item["shifts"]
+                    ],
+                    "best_transform": {
+                        "shift_change": item["best_shift"],
+                        "shift_lead": shift_lead(item["lead_ends"], item["best_shift"]),
+                        "direction": item["best_dir"],
+                    },
+                    "fingerprint": {
+                        "hash": item["fp_hash"],
+                        "rows": n + 1,
+                        "first_row": row_to_string(item["sequence"][0]),
+                        "last_row": row_to_string(item["sequence"][-1]),
+                    },
+                    "group": group_of[idx],
+                    "is_representative": item is rep,
+                    "relative_to_representative": rel,
+                }
+            )
+
+        group_payloads = []
+        for gid, g in enumerate(groups, 1):
+            rep = resolved[g["representative"]]
+            group_payloads.append(
+                {
+                    "id": gid,
+                    "fingerprint_hash": g["hash"],
+                    "size": len(g["members"]),
+                    "representative": {
+                        "id": rep["rec"]["id"],
+                        "version": rep["rec"]["version"],
+                    },
+                    "members": [
+                        {
+                            "id": resolved[i]["rec"]["id"],
+                            "version": resolved[i]["rec"]["version"],
+                        }
+                        for i in g["members"]
+                    ],
+                }
+            )
+
+        analysis_id = body.id or _new_id()
+        version = storage.next_round_block_version(analysis_id)
+        transform_rules = {
+            "shift_changes": (
+                sorted(body.shift_changes) if body.shift_changes is not None else None
+            ),
+            "allow_reverse": body.allow_reverse,
+            "fixed_bells": sorted(body.fixed_bells),
+        }
+        spec = {
+            "name": body.name,
+            "touches": [
+                {"id": item["rec"]["id"], "version": item["rec"]["version"]}
+                for item in resolved
+            ],
+            **transform_rules,
+        }
+        input_hash = canonical_hash(
+            {
+                "stage": stage,
+                "touches": [
+                    {
+                        "id": item["rec"]["id"],
+                        "version": item["rec"]["version"],
+                        "hash": item["rec"]["input_hash"],
+                    }
+                    for item in resolved
+                ],
+                **transform_rules,
+                "ringproof_version": __version__,
+            }
+        )
+        payload = {
+            "id": analysis_id,
+            "version": version,
+            "name": body.name,
+            "stage": stage,
+            "transform_rules": transform_rules,
+            "touches": member_payloads,
+            "groups": group_payloads,
+            "total_touches": len(resolved),
+            "total_groups": len(groups),
+            "equivalent_pairs": sum(g["size"] * (g["size"] - 1) // 2 for g in group_payloads),
+            "dependencies": _round_block_dependencies(resolved),
+            "input_hash": input_hash,
+            "created_at": utcnow(),
+        }
+        rec = {
+            "id": analysis_id,
+            "version": version,
+            "stage": stage,
+            "spec_json": json.dumps(spec, ensure_ascii=False, sort_keys=True),
+            "result_json": json.dumps(payload, ensure_ascii=False),
+            "input_hash": input_hash,
+            "created_at": payload["created_at"],
+        }
+        try:
+            storage.insert_round_block(rec)
+        except sqlite3.IntegrityError:
+            return JSONResponse(status_code=409, content={"detail": "该 (id, version) 已存在，版本不可变"})
+        return JSONResponse(payload, status_code=201)
+
+    @app.get("/round-block-analyses")
+    def list_round_block_analyses():
+        return {"round_block_analyses": storage.list_round_blocks()}
+
+    @app.get("/round-block-analyses/{analysis_id}")
+    def list_round_block_versions(analysis_id: str):
+        versions = [r for r in storage.list_round_blocks() if r["id"] == analysis_id]
+        if not versions:
+            return JSONResponse(status_code=404, content={"detail": f"round block 分析不存在: {analysis_id}"})
+        return {"id": analysis_id, "versions": versions}
+
+    @app.get("/round-block-analyses/{analysis_id}/versions/{version}")
+    def get_round_block_analysis(analysis_id: str, version: int):
+        """读取 round block 等价分析版本：变换规则、各 touch 的合法移位与
+        规范指纹、等价分组与代表项、成员相对代表项的移位/方向/钟号映射。
+        分析冻结全部 touch 依赖与变换规则，同一版本重复读取结果一致。"""
+        rec = storage.get_round_block(analysis_id, version)
+        if not rec:
+            return JSONResponse(status_code=404, content={"detail": f"round block 分析版本不存在: {analysis_id} v{version}"})
+        return json.loads(rec["result_json"])
+
+    @app.get("/round-block-analyses/{analysis_id}/versions/{version}/compare")
+    def compare_round_block(
+        analysis_id: str,
+        version: int,
+        touch_a: str = Query(..., description="成员 touch id（对照基准）"),
+        version_a: int = Query(..., ge=1),
+        touch_b: str = Query(..., description="成员 touch id（被对照项）"),
+        version_b: int = Query(..., ge=1),
+        offset: int = Query(0, ge=0),
+        limit: int = Query(500, ge=1, le=10000),
+    ):
+        """比较分析中的两个 touch 版本：等价时给出 b 相对 a 的方向、移位
+        （change/lead）、钟号映射与逐 row 对照（分页）；不等价时给出两个
+        规范指纹的最早分歧 row 及双方在原 touch 中的 method/lead/call 来源。
+        结果由冻结的分析版本与不可变 touch 决定，重复读取保持一致。"""
+        rec = storage.get_round_block(analysis_id, version)
+        if not rec:
+            return JSONResponse(status_code=404, content={"detail": f"round block 分析版本不存在: {analysis_id} v{version}"})
+        payload = json.loads(rec["result_json"])
+        members = {
+            (m["touch"]["id"], m["touch"]["version"]): m for m in payload["touches"]
+        }
+        ma = members.get((touch_a, version_a))
+        mb = members.get((touch_b, version_b))
+        for key, m in (((touch_a, version_a), ma), ((touch_b, version_b), mb)):
+            if m is None:
+                raise RoundBlockError(
+                    "TOUCH_NOT_IN_ANALYSIS",
+                    f"touch {key[0]!r} v{key[1]} 不在分析 {analysis_id} v{version} 中",
+                )
+        sides: dict[tuple[str, int], dict] = {}
+        for key in ((touch_a, version_a), (touch_b, version_b)):
+            touch_rec = storage.get_touch(key[0], key[1])
+            if not touch_rec:
+                raise RoundBlockError(
+                    "TOUCH_MISSING", f"分析引用的 touch 版本缺失: {key[0]} v{key[1]}"
+                )
+            _, rows, events, lead_ends = _expand_touch_for_blocks(touch_rec)
+            sides[key] = {"rows": rows, "events": events, "lead_ends": lead_ends}
+        sa = sides[(touch_a, version_a)]
+        sb = sides[(touch_b, version_b)]
+        ta, tb = ma["best_transform"], mb["best_transform"]
+
+        base = {
+            "analysis_id": analysis_id,
+            "analysis_version": version,
+            "input_hash": rec["input_hash"],
+            "a": {
+                "id": touch_a,
+                "version": version_a,
+                "group": ma["group"],
+                "best_transform": ta,
+                "fingerprint": ma["fingerprint"],
+            },
+            "b": {
+                "id": touch_b,
+                "version": version_b,
+                "group": mb["group"],
+                "best_transform": tb,
+                "fingerprint": mb["fingerprint"],
+            },
+        }
+        if ma["fingerprint"]["hash"] == mb["fingerprint"]["hash"]:
+            # 等价：b 相对 a 的方向、移位、钟号映射与逐 row 对照
+            rows_a, rows_b = sa["rows"], sb["rows"]
+            n = len(rows_a) - 1
+            direction, delta, align = alignment(
+                {"shift": tb["shift_change"], "direction": tb["direction"]},
+                {"shift": ta["shift_change"], "direction": ta["direction"]},
+                n,
+            )
+            images = bell_mapping_images(
+                rows_b[tb["shift_change"]], rows_a[ta["shift_change"]]
+            )
+            matched = sum(
+                1
+                for j in range(n + 1)
+                if permute_row(images, rows_a[align(j)]) == rows_b[j]
+            )
+            entries = []
+            for j in range(offset, min(offset + limit, n + 1)):
+                k = align(j)
+                mapped = permute_row(images, rows_a[k])
+                entries.append(
+                    {
+                        "change": j,
+                        "lead": lead_of_change(sb["lead_ends"], j),
+                        "row": row_to_string(rows_b[j]),
+                        "aligned": {
+                            "change": k,
+                            "lead": lead_of_change(sa["lead_ends"], k),
+                            "row": row_to_string(rows_a[k]),
+                            "mapped_row": row_to_string(mapped),
+                        },
+                        "match": mapped == rows_b[j],
+                    }
+                )
+            return {
+                **base,
+                "equivalent": True,
+                "transform": {
+                    "direction": direction,
+                    "shift_change": delta,
+                    "shift_lead": shift_lead(sa["lead_ends"], delta),
+                    "bell_mapping": perm_payload(images),
+                },
+                "rows_total": n + 1,
+                "rows_matched": matched,
+                "offset": offset,
+                "limit": limit,
+                "comparison": entries,
+            }
+
+        # 不等价：比较两个规范指纹序列，给出最早分歧 row 与双方来源
+        seq_a = normalize_rows(
+            sa["rows"], ta["shift_change"], ta["direction"] == "reversed"
+        )
+        seq_b = normalize_rows(
+            sb["rows"], tb["shift_change"], tb["direction"] == "reversed"
+        )
+        i = first_divergence(seq_a, seq_b)
+
+        def _side(seq, side, t):
+            n_side = len(side["rows"]) - 1
+            if i is None or i >= len(seq):
+                return {"exhausted": True, "fingerprint_row": None, "provenance": None}
+            c = original_change(i, t["shift_change"], t["direction"], n_side)
+            return {
+                "exhausted": False,
+                "fingerprint_row": row_to_string(seq[i]),
+                "provenance": row_provenance(side["rows"], side["events"], c),
+            }
+
+        return {
+            **base,
+            "equivalent": False,
+            "first_divergence": {
+                "row_index": i,
+                "a": _side(seq_a, sa, ta),
+                "b": _side(seq_b, sb, tb),
+            },
+        }
+
     # ---------- 部分 touch：前缀校核 ----------
     @app.post("/prefixes", status_code=201)
     def create_prefix(body: PrefixCreate):
@@ -2853,6 +3341,43 @@ def create_app(db_path: str | None = None) -> FastAPI:
                  "input_hash": touch_recs[key]["input_hash"]}
             )
             ctx = expansions[key][0]
+            for m in ctx["methods"]:
+                methods[(m["id"], m["version"])] = {
+                    "id": m["id"],
+                    "version": m["version"],
+                    "input_hash": m["input_hash"],
+                }
+            for name, c in sorted(ctx["call_defs"].items()):
+                calls.append(
+                    {
+                        "touch_id": key[0],
+                        "touch_version": key[1],
+                        "name": name,
+                        "notation": c["notation"],
+                        "replace": c["replace"],
+                    }
+                )
+        return {
+            "ringproof_version": __version__,
+            "touches": touches,
+            "methods": list(methods.values()),
+            "calls": calls,
+        }
+
+    def _round_block_dependencies(resolved: list[dict]) -> dict:
+        """round block 分析冻结的依赖版本：touch、方法与各 touch 的 call 定义。"""
+        touches: list[dict] = []
+        methods: dict[tuple[str, int], dict] = {}
+        calls: list[dict] = []
+        for item in resolved:
+            rec = item["rec"]
+            key = (rec["id"], rec["version"])
+            if any(t["id"] == key[0] and t["version"] == key[1] for t in touches):
+                continue
+            touches.append(
+                {"id": key[0], "version": key[1], "input_hash": rec["input_hash"]}
+            )
+            ctx = item["ctx"]
             for m in ctx["methods"]:
                 methods[(m["id"], m["version"])] = {
                     "id": m["id"],
